@@ -388,7 +388,9 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
 
 
 # load model weights
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+print(f"=============== Using device: {device} ================")
 vae, unet, pe = load_all_model(
     unet_model_path="./models/musetalkV15/unet.pth", 
     vae_type="sd-vae",
@@ -400,7 +402,7 @@ vae, unet, pe = load_all_model(
 parser = argparse.ArgumentParser()
 parser.add_argument("--ffmpeg_path", type=str, default=r"ffmpeg-master-latest-win64-gpl-shared\bin", help="Path to ffmpeg executable")
 parser.add_argument("--ip", type=str, default="127.0.0.1", help="IP address to bind to")
-parser.add_argument("--port", type=int, default=7860, help="Port to bind to")
+parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
 parser.add_argument("--share", action="store_true", help="Create a public link")
 parser.add_argument("--use_float16", action="store_true", help="Use float16 for faster inference")
 args = parser.parse_args()
@@ -565,6 +567,6 @@ if sys.platform == 'win32':
 demo.queue().launch(
     share=args.share, 
     debug=True, 
-    server_name=args.ip, 
-    server_port=args.port
+    server_name="10.202.15.248",
+    server_port=8000
 )

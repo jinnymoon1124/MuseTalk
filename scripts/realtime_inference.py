@@ -352,7 +352,9 @@ if __name__ == "__main__":
             print("Warning: Unable to find ffmpeg, please ensure ffmpeg is properly installed")
 
     # Set computing device
-    device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
+    # device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:1" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
     # Load model weights
     vae, unet, pe = load_all_model(
