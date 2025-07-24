@@ -33,94 +33,104 @@ ProjectDir = os.path.abspath(os.path.dirname(__file__))
 CheckpointsDir = os.path.join(ProjectDir, "models")
 
 @torch.no_grad()
-def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
-                    left_cheek_width=90, right_cheek_width=90):
-    """Debug inpainting parameters, only process the first frame"""
-    # Set default parameters
-    args_dict = {
-        "result_dir": './results/debug', 
-        "fps": 50,  
-        "batch_size": 1, 
-        "output_vid_name": '', 
-        "use_saved_coord": False,
-        "audio_padding_length_left": 2,
-        "audio_padding_length_right": 2,
-        "version": "v15",
-        "extra_margin": extra_margin,
-        "parsing_mode": parsing_mode,
-        "left_cheek_width": left_cheek_width,
-        "right_cheek_width": right_cheek_width
-    }
-    args = Namespace(**args_dict)
+# def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
+#                     left_cheek_width=90, right_cheek_width=90, 
+#                     enable_occlusion_detection=True, occlusion_sensitivity=0.3):
+#     """Debug inpainting parameters, only process the first frame"""
+#     # Set default parameters
+#     args_dict = {
+#         "result_dir": './results/debug', 
+#         "fps": 50,  
+#         "batch_size": 1, 
+#         "output_vid_name": '', 
+#         "use_saved_coord": False,
+#         "audio_padding_length_left": 2,
+#         "audio_padding_length_right": 2,
+#         "version": "v15",
+#         "extra_margin": extra_margin,
+#         "parsing_mode": parsing_mode,
+#         "left_cheek_width": left_cheek_width,
+#         "right_cheek_width": right_cheek_width
+#     }
+#     args = Namespace(**args_dict)
 
-    # Create debug directory
-    os.makedirs(args.result_dir, exist_ok=True)
+#     # Create debug directory
+#     os.makedirs(args.result_dir, exist_ok=True)
     
-    # Read first frame
-    if get_file_type(video_path) == "video":
-        reader = imageio.get_reader(video_path)
-        first_frame = reader.get_data(0)
-        reader.close()
-    else:
-        first_frame = cv2.imread(video_path)
-        first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+#     # Read first frame
+#     if get_file_type(video_path) == "video":
+#         reader = imageio.get_reader(video_path)
+#         first_frame = reader.get_data(0)
+#         reader.close()
+#     else:
+#         first_frame = cv2.imread(video_path)
+#         first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
     
-    # Save first frame
-    debug_frame_path = os.path.join(args.result_dir, "debug_frame.png")
-    cv2.imwrite(debug_frame_path, cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
+#     # Save first frame
+#     debug_frame_path = os.path.join(args.result_dir, "debug_frame.png")
+#     cv2.imwrite(debug_frame_path, cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
     
-    # Get face coordinates
-    coord_list, frame_list = get_landmark_and_bbox([debug_frame_path], bbox_shift)
-    bbox = coord_list[0]
-    frame = frame_list[0]
+#     # Get face coordinates
+#     coord_list, frame_list = get_landmark_and_bbox([debug_frame_path], bbox_shift)
+#     bbox = coord_list[0]
+#     frame = frame_list[0]
     
-    if bbox == coord_placeholder:
-        return None, "No face detected, please adjust bbox_shift parameter"
+#     if bbox == coord_placeholder:
+#         return None, "No face detected, please adjust bbox_shift parameter"
     
-    # Initialize face parser
-    fp = FaceParsing(
-        left_cheek_width=args.left_cheek_width,
-        right_cheek_width=args.right_cheek_width
-    )
+#     # Initialize face parser
+#     fp = FaceParsing(
+#         left_cheek_width=args.left_cheek_width,
+#         right_cheek_width=args.right_cheek_width
+#     )
     
-    # Process first frame
-    x1, y1, x2, y2 = bbox
-    y2 = y2 + args.extra_margin
-    y2 = min(y2, frame.shape[0])
-    crop_frame = frame[y1:y2, x1:x2]
-    crop_frame = cv2.resize(crop_frame,(256,256),interpolation = cv2.INTER_LANCZOS4)
+#     # Process first frame
+#     x1, y1, x2, y2 = bbox
+#     y2 = y2 + args.extra_margin
+#     y2 = min(y2, frame.shape[0])
+#     crop_frame = frame[y1:y2, x1:x2]
+#     crop_frame = cv2.resize(crop_frame,(256,256),interpolation = cv2.INTER_LANCZOS4)
     
-    # Generate random audio features
-    random_audio = torch.randn(1, 50, 384, device=device, dtype=weight_dtype)
-    audio_feature = pe(random_audio)
+#     # Generate random audio features
+#     random_audio = torch.randn(1, 50, 384, device=device, dtype=weight_dtype)
+#     audio_feature = pe(random_audio)
     
-    # Get latents
-    latents = vae.get_latents_for_unet(crop_frame)
-    latents = latents.to(dtype=weight_dtype)
+#     # Get latents
+#     latents = vae.get_latents_for_unet(crop_frame)
+#     latents = latents.to(dtype=weight_dtype)
     
-    # Generate prediction results
-    pred_latents = unet.model(latents, timesteps, encoder_hidden_states=audio_feature).sample
-    recon = vae.decode_latents(pred_latents)
+#     # Generate prediction results
+#     pred_latents = unet.model(latents, timesteps, encoder_hidden_states=audio_feature).sample
+#     recon = vae.decode_latents(pred_latents)
     
-    # Inpaint back to original image
-    res_frame = recon[0]
-    res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
-    combine_frame = get_image(frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+#     # Inpaint back to original image
+#     res_frame = recon[0]
+#     res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
     
-    # Save results (no need to convert color space again since get_image already returns RGB format)
-    debug_result_path = os.path.join(args.result_dir, "debug_result.png")
-    cv2.imwrite(debug_result_path, combine_frame)
+#     # 가림 감지 기능을 포함한 블렌딩 적용
+#     combine_frame = get_image(frame, res_frame, [x1, y1, x2, y2], 
+#                              mode=args.parsing_mode, fp=fp,
+#                              enable_occlusion_detection=enable_occlusion_detection,
+#                              occlusion_sensitivity=occlusion_sensitivity)
     
-    # Create information text
-    info_text = f"Parameter information:\n" + \
-                f"bbox_shift: {bbox_shift}\n" + \
-                f"extra_margin: {extra_margin}\n" + \
-                f"parsing_mode: {parsing_mode}\n" + \
-                f"left_cheek_width: {left_cheek_width}\n" + \
-                f"right_cheek_width: {right_cheek_width}\n" + \
-                f"Detected face coordinates: [{x1}, {y1}, {x2}, {y2}]"
+#     # Save results (no need to convert color space again since get_image already returns RGB format)
+#     debug_result_path = os.path.join(args.result_dir, "debug_result.png")
+#     cv2.imwrite(debug_result_path, combine_frame)
     
-    return cv2.cvtColor(combine_frame, cv2.COLOR_RGB2BGR), info_text
+#     # Create information text
+#     info_text = f"Parameter information:\n" + \
+#                 f"bbox_shift: {bbox_shift}\n" + \
+#                 f"extra_margin: {extra_margin}\n" + \
+#                 f"parsing_mode: {parsing_mode}\n" + \
+#                 f"left_cheek_width: {left_cheek_width}\n" + \
+#                 f"right_cheek_width: {right_cheek_width}\n" + \
+#                 f"enable_occlusion_detection: {enable_occlusion_detection}\n" + \
+#                 f"occlusion_sensitivity: {occlusion_sensitivity}\n" + \
+#                 f"Detected face coordinates: [{x1}, {y1}, {x2}, {y2}]"
+    
+#     return cv2.cvtColor(combine_frame, cv2.COLOR_RGB2BGR), info_text
+
+
 
 def print_directory_contents(path):
     for child in os.listdir(path):
@@ -182,7 +192,9 @@ def fast_check_ffmpeg():
 
 @torch.no_grad()
 def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
-              left_cheek_width=90, right_cheek_width=90, progress=gr.Progress(track_tqdm=True)):
+              left_cheek_width=90, right_cheek_width=90, 
+              enable_occlusion_detection=True, occlusion_sensitivity=0.3,
+              progress=gr.Progress(track_tqdm=True)):
     # Set default parameters, aligned with inference.py
     args_dict = {
         "result_dir": './results/output', 
@@ -325,8 +337,11 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         except:
             continue
         
-        # Use v15 version blending
-        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+        # 가림 감지 기능을 포함한 v15 버전 블렌딩 사용
+        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], 
+                                 mode=args.parsing_mode, fp=fp,
+                                 enable_occlusion_detection=enable_occlusion_detection,
+                                 occlusion_sensitivity=occlusion_sensitivity)
             
         cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
         
@@ -495,14 +510,23 @@ with gr.Blocks(css=css) as demo:
             parsing_mode = gr.Radio(label="Parsing Mode", choices=["jaw", "raw"], value="jaw")
             left_cheek_width = gr.Slider(label="Left Cheek Width", minimum=0, maximum=200, value=20, step=1)
             right_cheek_width = gr.Slider(label="Right Cheek Width", minimum=0, maximum=200, value=20, step=1)
-            bbox_shift_scale = gr.Textbox(label="'left_cheek_width' and 'right_cheek_width' parameters determine the range of left and right cheeks editing when parsing model is 'jaw'. The 'extra_margin' parameter determines the movement range of the jaw. Users can freely adjust these three parameters to obtain better inpainting results.")
+            
+            # 가림 감지 관련 컨트롤 추가
+            with gr.Group():
+                gr.Markdown("### 가림 감지 설정 (Occlusion Detection)")
+                enable_occlusion_detection = gr.Checkbox(label="가림 감지 활성화 (Enable Occlusion Detection)", value=True)
+                occlusion_sensitivity = gr.Slider(label="가림 감지 민감도 (Occlusion Sensitivity)", 
+                                                 minimum=0.1, maximum=1.0, value=0.3, step=0.1,
+                                                 info="값이 높을수록 더 민감하게 가림을 감지합니다")
+            
+            bbox_shift_scale = gr.Textbox(label="'left_cheek_width'와 'right_cheek_width' 파라미터는 파싱 모델이 'jaw'일 때 좌우 볼 편집 범위를 결정합니다. 'extra_margin' 파라미터는 턱의 움직임 범위를 결정합니다. 사용자는 이 세 파라미터를 자유롭게 조정하여 더 나은 인페인팅 결과를 얻을 수 있습니다. 가림 감지 기능은 마이크 등의 물체에 의해 얼굴이 가려진 부분에서 자연스러운 립싱크를 제공합니다.")
 
             with gr.Row():
                 debug_btn = gr.Button("1. Test Inpainting ")
                 btn = gr.Button("2. Generate")
         with gr.Column():
-            debug_image = gr.Image(label="Test Inpainting Result (First Frame)")
-            debug_info = gr.Textbox(label="Parameter Information", lines=5)
+            # debug_image = gr.Image(label="Test Inpainting Result (First Frame)")
+            debug_info = gr.Textbox(label="Parameter Information", lines=8)
             out1 = gr.Video()
     
     video.change(
@@ -517,22 +541,26 @@ with gr.Blocks(css=css) as demo:
             extra_margin,
             parsing_mode,
             left_cheek_width,
-            right_cheek_width
+            right_cheek_width,
+            enable_occlusion_detection,
+            occlusion_sensitivity
         ],
         outputs=[out1,bbox_shift_scale]
     )
-    debug_btn.click(
-        fn=debug_inpainting,
-        inputs=[
-            video,
-            bbox_shift,
-            extra_margin,
-            parsing_mode,
-            left_cheek_width,
-            right_cheek_width
-        ],
-        outputs=[debug_image, debug_info]
-    )
+    # debug_btn.click(
+    #     fn=debug_inpainting,
+    #     inputs=[
+    #         video,
+    #         bbox_shift,
+    #         extra_margin,
+    #         parsing_mode,
+    #         left_cheek_width,
+    #         right_cheek_width,
+    #         enable_occlusion_detection,
+    #         occlusion_sensitivity
+    #     ],
+    #     outputs=[debug_image, debug_info]
+    # )
 
 # Check ffmpeg and add to PATH
 # if not fast_check_ffmpeg():
