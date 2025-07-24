@@ -1,20 +1,10 @@
 import os
-import time
-import pdb
 import re
-
 import gradio as gr
 import numpy as np
 import sys
 import subprocess
-
-from huggingface_hub import snapshot_download
-import requests
-
 import argparse
-import os
-from omegaconf import OmegaConf
-import numpy as np
 import cv2
 import torch
 import glob
@@ -22,111 +12,120 @@ import pickle
 from tqdm import tqdm
 import copy
 from argparse import Namespace
-import shutil
-import gdown
 import imageio
-import ffmpeg
 from moviepy.editor import *
 from transformers import WhisperModel
+
+# 사용X
+# import time
+# import pdb
+# from huggingface_hub import snapshot_download
+# import requests
+# from omegaconf import OmegaConf
+# import shutil
+# import gdown
+# import ffmpeg
+
+
 
 ProjectDir = os.path.abspath(os.path.dirname(__file__))
 CheckpointsDir = os.path.join(ProjectDir, "models")
 
 @torch.no_grad()
-def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
-                    left_cheek_width=90, right_cheek_width=90):
-    """Debug inpainting parameters, only process the first frame"""
-    # Set default parameters
-    args_dict = {
-        "result_dir": './results/debug', 
-        "fps": 50,  
-        "batch_size": 1, 
-        "output_vid_name": '', 
-        "use_saved_coord": False,
-        "audio_padding_length_left": 2,
-        "audio_padding_length_right": 2,
-        "version": "v15",
-        "extra_margin": extra_margin,
-        "parsing_mode": parsing_mode,
-        "left_cheek_width": left_cheek_width,
-        "right_cheek_width": right_cheek_width
-    }
-    args = Namespace(**args_dict)
+# def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
+#                     left_cheek_width=90, right_cheek_width=90):
+#     """Debug inpainting parameters, only process the first frame"""
+#     # Set default parameters
+#     args_dict = {
+#         "result_dir": './results/debug', 
+#         "fps": 50,  
+#         "batch_size": 1, 
+#         "output_vid_name": '', 
+#         "use_saved_coord": False,
+#         "audio_padding_length_left": 2,
+#         "audio_padding_length_right": 2,
+#         "version": "v15",
+#         "extra_margin": extra_margin,
+#         "parsing_mode": parsing_mode,
+#         "left_cheek_width": left_cheek_width,
+#         "right_cheek_width": right_cheek_width
+#     }
+#     args = Namespace(**args_dict)
 
-    # Create debug directory
-    os.makedirs(args.result_dir, exist_ok=True)
+#     # Create debug directory
+#     os.makedirs(args.result_dir, exist_ok=True)
     
-    # Read first frame
-    if get_file_type(video_path) == "video":
-        reader = imageio.get_reader(video_path)
-        first_frame = reader.get_data(0)
-        reader.close()
-    else:
-        first_frame = cv2.imread(video_path)
-        first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+#     # Read first frame
+#     if get_file_type(video_path) == "video":
+#         reader = imageio.get_reader(video_path)
+#         first_frame = reader.get_data(0)
+#         reader.close()
+#     else:
+#         first_frame = cv2.imread(video_path)
+#         first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
     
-    # Save first frame
-    debug_frame_path = os.path.join(args.result_dir, "debug_frame.png")
-    cv2.imwrite(debug_frame_path, cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
+#     # Save first frame
+#     debug_frame_path = os.path.join(args.result_dir, "debug_frame.png")
+#     cv2.imwrite(debug_frame_path, cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
     
-    # Get face coordinates
-    coord_list, frame_list = get_landmark_and_bbox([debug_frame_path], bbox_shift)
-    bbox = coord_list[0]
-    frame = frame_list[0]
+#     # Get face coordinates
+#     coord_list, frame_list = get_landmark_and_bbox([debug_frame_path], bbox_shift)
+#     bbox = coord_list[0]
+#     frame = frame_list[0]
     
-    if bbox == coord_placeholder:
-        return None, "No face detected, please adjust bbox_shift parameter"
+#     if bbox == coord_placeholder:
+#         return None, "No face detected, please adjust bbox_shift parameter"
     
-    # Initialize face parser
-    fp = FaceParsing(
-        left_cheek_width=args.left_cheek_width,
-        right_cheek_width=args.right_cheek_width
-    )
+#     # Initialize face parser
+#     fp = FaceParsing(
+#         left_cheek_width=args.left_cheek_width,
+#         right_cheek_width=args.right_cheek_width
+#     )
     
-    # Process first frame
-    x1, y1, x2, y2 = bbox
-    y2 = y2 + args.extra_margin
-    y2 = min(y2, frame.shape[0])
-    crop_frame = frame[y1:y2, x1:x2]
-    crop_frame = cv2.resize(crop_frame,(256,256),interpolation = cv2.INTER_LANCZOS4)
+#     # Process first frame
+#     x1, y1, x2, y2 = bbox
+#     y2 = y2 + args.extra_margin
+#     y2 = min(y2, frame.shape[0])
+#     crop_frame = frame[y1:y2, x1:x2]
+#     crop_frame = cv2.resize(crop_frame,(256,256),interpolation = cv2.INTER_LANCZOS4)
     
-    # Generate random audio features
-    random_audio = torch.randn(1, 50, 384, device=device, dtype=weight_dtype)
-    audio_feature = pe(random_audio)
+#     # Generate random audio features
+#     random_audio = torch.randn(1, 50, 384, device=device, dtype=weight_dtype)
+#     audio_feature = pe(random_audio)
     
-    # Get latents
-    latents = vae.get_latents_for_unet(crop_frame)
-    latents = latents.to(dtype=weight_dtype)
+#     # Get latents
+#     latents = vae.get_latents_for_unet(crop_frame)
+#     latents = latents.to(dtype=weight_dtype)
     
-    # Generate prediction results
-    pred_latents = unet.model(latents, timesteps, encoder_hidden_states=audio_feature).sample
-    recon = vae.decode_latents(pred_latents)
+#     # Generate prediction results
+#     pred_latents = unet.model(latents, timesteps, encoder_hidden_states=audio_feature).sample
+#     recon = vae.decode_latents(pred_latents)
     
-    # Inpaint back to original image
-    res_frame = recon[0]
-    res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
-    combine_frame = get_image(frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+#     # Inpaint back to original image
+#     res_frame = recon[0]
+#     res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
+#     combine_frame = get_image(frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
     
-    # Save results (no need to convert color space again since get_image already returns RGB format)
-    debug_result_path = os.path.join(args.result_dir, "debug_result.png")
-    cv2.imwrite(debug_result_path, combine_frame)
+#     # Save results (no need to convert color space again since get_image already returns RGB format)
+#     debug_result_path = os.path.join(args.result_dir, "debug_result.png")
+#     cv2.imwrite(debug_result_path, combine_frame)
     
-    # Create information text
-    info_text = f"Parameter information:\n" + \
-                f"bbox_shift: {bbox_shift}\n" + \
-                f"extra_margin: {extra_margin}\n" + \
-                f"parsing_mode: {parsing_mode}\n" + \
-                f"left_cheek_width: {left_cheek_width}\n" + \
-                f"right_cheek_width: {right_cheek_width}\n" + \
-                f"Detected face coordinates: [{x1}, {y1}, {x2}, {y2}]"
+#     # Create information text
+#     info_text = f"Parameter information:\n" + \
+#                 f"bbox_shift: {bbox_shift}\n" + \
+#                 f"extra_margin: {extra_margin}\n" + \
+#                 f"parsing_mode: {parsing_mode}\n" + \
+#                 f"left_cheek_width: {left_cheek_width}\n" + \
+#                 f"right_cheek_width: {right_cheek_width}\n" + \
+#                 f"Detected face coordinates: [{x1}, {y1}, {x2}, {y2}]"
     
-    return cv2.cvtColor(combine_frame, cv2.COLOR_RGB2BGR), info_text
+#     return cv2.cvtColor(combine_frame, cv2.COLOR_RGB2BGR), info_text
 
-def print_directory_contents(path):
-    for child in os.listdir(path):
-        child_path = os.path.join(path, child)
-        if os.path.isdir(child_path):
-            print(child_path)
+# def print_directory_contents(path):
+#     for child in os.listdir(path):
+#         child_path = os.path.join(path, child)
+#         if os.path.isdir(child_path):
+#             print(child_path)
 
 def download_model():
     # 检查必需的模型文件是否存在
@@ -498,11 +497,11 @@ with gr.Blocks(css=css) as demo:
             bbox_shift_scale = gr.Textbox(label="'left_cheek_width' and 'right_cheek_width' parameters determine the range of left and right cheeks editing when parsing model is 'jaw'. The 'extra_margin' parameter determines the movement range of the jaw. Users can freely adjust these three parameters to obtain better inpainting results.")
 
             with gr.Row():
-                debug_btn = gr.Button("1. Test Inpainting ")
-                btn = gr.Button("2. Generate")
+                # debug_btn = gr.Button("1. Test Inpainting ")
+                btn = gr.Button("Generate")
         with gr.Column():
-            debug_image = gr.Image(label="Test Inpainting Result (First Frame)")
-            debug_info = gr.Textbox(label="Parameter Information", lines=5)
+            # debug_image = gr.Image(label="Test Inpainting Result (First Frame)")
+            # debug_info = gr.Textbox(label="Parameter Information", lines=5)
             out1 = gr.Video()
     
     video.change(
@@ -521,18 +520,18 @@ with gr.Blocks(css=css) as demo:
         ],
         outputs=[out1,bbox_shift_scale]
     )
-    debug_btn.click(
-        fn=debug_inpainting,
-        inputs=[
-            video,
-            bbox_shift,
-            extra_margin,
-            parsing_mode,
-            left_cheek_width,
-            right_cheek_width
-        ],
-        outputs=[debug_image, debug_info]
-    )
+    # debug_btn.click(
+    #     fn=debug_inpainting,
+    #     inputs=[
+    #         video,
+    #         bbox_shift,
+    #         extra_margin,
+    #         parsing_mode,
+    #         left_cheek_width,
+    #         right_cheek_width
+    #     ],
+    #     outputs=[debug_image, debug_info]
+    # )
 
 # Check ffmpeg and add to PATH
 # if not fast_check_ffmpeg():
