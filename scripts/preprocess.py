@@ -96,7 +96,7 @@ def convert_video(org_path: str, dst_path: str, vid_list: List[str]) -> None:
             if org_vid_path != dst_vid_path:
                 cmd = [
                     "ffmpeg", "-hide_banner", "-y", "-i", org_vid_path, 
-                    "-r", "25", "-crf", "15", "-c:v", "libx264", 
+                    "-r", 50", "-crf", "15", "-c:v", "libx264", 
                     "-pix_fmt", "yuv420p", dst_vid_path
                 ]
                 subprocess.run(cmd, check=True)
@@ -307,7 +307,7 @@ def main(cfg):
         for vid in sorted_vid_list:
             file.write(vid + '\n')
 
-    # 1. Convert videos to 25 FPS
+    # 1. Convert videos to 50 FPS
     convert_video(cfg.video_root_raw, cfg.video_root_25fps, sorted_vid_list)
     
     # 2. Segment videos into 30-second clips

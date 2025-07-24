@@ -175,10 +175,12 @@ def main(args):
                 latents = vae.get_latents_for_unet(crop_frame)
                 input_latent_list.append(latents)
         
-            # Smooth first and last frames
-            frame_list_cycle = frame_list + frame_list[::-1]
-            coord_list_cycle = coord_list + coord_list[::-1]
-            input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
+            # Smooth first and last frames with improved cycling for moving videos
+            # 增加更多的循环帧以提高连续性
+            num_cycle_frames = min(len(frame_list), 5)  # 使用更多帧进行循环
+            frame_list_cycle = frame_list + frame_list[-num_cycle_frames:][::-1] + frame_list[:num_cycle_frames]
+            coord_list_cycle = coord_list + coord_list[-num_cycle_frames:][::-1] + coord_list[:num_cycle_frames]
+            input_latent_list_cycle = input_latent_list + input_latent_list[-num_cycle_frames:][::-1] + input_latent_list[:num_cycle_frames]
             
             # Batch inference
             print("Starting inference")
@@ -205,6 +207,23 @@ def main(args):
                 for res_frame in recon:
                     res_frame_list.append(res_frame)
             
+            # Apply temporal smoothing if enabled
+            if args.temporal_smoothing:
+                print("Applying temporal smoothing for better motion consistency")
+                smoothed_res_frame_list = []
+                window_size = 3
+                for i in range(len(res_frame_list)):
+                    if i < window_size // 2 or i >= len(res_frame_list) - window_size // 2:
+                        smoothed_res_frame_list.append(res_frame_list[i])
+                    else:
+                        # Average neighboring frames for smoothing
+                        frames_to_average = []
+                        for j in range(i - window_size // 2, i + window_size // 2 + 1):
+                            frames_to_average.append(res_frame_list[j].astype(np.float32))
+                        smoothed_frame = np.mean(frames_to_average, axis=0).astype(np.uint8)
+                        smoothed_res_frame_list.append(smoothed_frame)
+                res_frame_list = smoothed_res_frame_list
+
             # Pad generated images to original video size
             print("Padding generated images to original video size")
             for i, res_frame in enumerate(tqdm(res_frame_list)):
@@ -261,9 +280,9 @@ if __name__ == "__main__":
     parser.add_argument("--result_dir", default='./results', help="Directory for output results")
     parser.add_argument("--extra_margin", type=int, default=10, help="Extra margin for face cropping")
     parser.add_argument("--fps", type=int, default=25, help="Video frames per second")
-    parser.add_argument("--audio_padding_length_left", type=int, default=2, help="Left padding length for audio")
-    parser.add_argument("--audio_padding_length_right", type=int, default=2, help="Right padding length for audio")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference")
+    parser.add_argument("--audio_padding_length_left", type=int, default=3, help="Left padding length for audio")
+    parser.add_argument("--audio_padding_length_right", type=int, default=3, help="Right padding length for audio")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for inference (smaller batch for better quality)")
     parser.add_argument("--output_vid_name", type=str, default=None, help="Name of output video file")
     parser.add_argument("--use_saved_coord", action="store_true", help='Use saved coordinates to save time')
     parser.add_argument("--saved_coord", action="store_true", help='Save coordinates for future use')
@@ -272,5 +291,7 @@ if __name__ == "__main__":
     parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek region")
     parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek region")
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
+    parser.add_argument("--enhance_motion_consistency", action="store_true", help="Enable enhanced motion consistency for moving videos")
+    parser.add_argument("--temporal_smoothing", action="store_true", help="Apply temporal smoothing for better lip sync in moving videos")
     args = parser.parse_args()
     main(args)

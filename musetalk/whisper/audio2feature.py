@@ -17,7 +17,7 @@ class Audio2Feature():
                            feature_array, 
                            vid_idx, 
                            audio_feat_length=[2,2],
-                           fps=25):
+                           fps=50):
         """
         Get sliced features based on a given index
         :param feature_array: 
@@ -44,7 +44,7 @@ class Audio2Feature():
         selected_feature = selected_feature.reshape(-1, 384)# 50*384
         return selected_feature,selected_idx
 
-    def get_sliced_feature_sparse(self,feature_array, vid_idx, audio_feat_length= [2,2],fps = 25):
+    def get_sliced_feature_sparse(self,feature_array, vid_idx, audio_feat_length= [2,2],fps = 50):
         """
         Get sliced features based on a given index
         :param feature_array: 
@@ -114,7 +114,7 @@ if __name__ == "__main__":
     audio_path = "./test.mp3"
     array = audio_processor.audio2feat(audio_path)
     print(array.shape)
-    fps = 25
+    fps = 50
     whisper_idx_multiplier = 50./fps 
 
     i = 0

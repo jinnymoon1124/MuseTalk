@@ -174,17 +174,17 @@ class FaceDataset(Dataset):
         audio_input_librosa, sampling_rate = librosa.load(wav_path, sr=16000)
         assert sampling_rate == 16000
 
-        while start_index >= 25 * 30:
+        while start_index >= 50 * 30:
             audio_input = audio_input_librosa[16000*30:]
-            start_index -= 25 * 30
-        if start_index + 2 * 25 >= 25 * 30:
-            start_index -= 4 * 25
+            start_index -= 50 * 30
+        if start_index + 2 * 50 >= 50 * 30:
+            start_index -= 4 * 50
             audio_input = audio_input_librosa[16000*4:16000*34]
         else:
             audio_input = audio_input_librosa[:16000*30]
 
         assert 2 * (start_index) >= 0
-        assert 2 * (start_index + 2 * 25) <= 1500
+        assert 2 * (start_index + 2 * 50) <= 1500
 
         audio_input = self.feature_extractor(
             audio_input,
@@ -224,7 +224,7 @@ class FaceDataset(Dataset):
         orig_mel = audio.melspectrogram(audio_input)
         return orig_mel.T
 
-    def crop_audio_window(self, spec, start_frame_num, fps=25):
+    def crop_audio_window(self, spec, start_frame_num, fps=50):
         """Crop audio window
         
         Args:
@@ -235,7 +235,7 @@ class FaceDataset(Dataset):
         Returns:
             ndarray: Cropped spectrogram
         """
-        start_idx = int(80. * (start_frame_num / float(fps)))
+        start_idx = int(80. * (start_frame_num / float(fps))) # 80 is the number of mel bins
         end_idx = start_idx + syncnet_mel_step_size
         return spec[start_idx: end_idx, :]
 
@@ -454,7 +454,7 @@ class FaceDataset(Dataset):
             # Process audio features
             audio_offset = drive_idx_list[0]
             audio_step = step
-            fps = 25.0 / step
+            fps = 50.0 / step
 
             try:
                 audio_feature, audio_offset = self.get_audio_file(wav_path, audio_offset)

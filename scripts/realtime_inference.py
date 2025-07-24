@@ -325,7 +325,7 @@ if __name__ == "__main__":
     parser.add_argument("--bbox_shift", type=int, default=0, help="Bounding box shift value")
     parser.add_argument("--result_dir", default='./results', help="Directory for output results")
     parser.add_argument("--extra_margin", type=int, default=10, help="Extra margin for face cropping")
-    parser.add_argument("--fps", type=int, default=25, help="Video frames per second")
+    parser.add_argument("--fps", type=int, default=50, help="Video frames per second")
     parser.add_argument("--audio_padding_length_left", type=int, default=2, help="Left padding length for audio")
     parser.add_argument("--audio_padding_length_right", type=int, default=2, help="Right padding length for audio")
     parser.add_argument("--batch_size", type=int, default=20, help="Batch size for inference")

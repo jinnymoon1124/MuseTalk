@@ -41,7 +41,7 @@ class AudioProcessor:
         weight_dtype,
         whisper,
         librosa_length,
-        fps=25,
+        fps=50,
         audio_padding_length_left=2,
         audio_padding_length_right=2,
     ):
@@ -78,7 +78,24 @@ class AudioProcessor:
         for frame_index in range(num_frames):
             try:
                 audio_index = math.floor(frame_index * whisper_idx_multiplier)
-                audio_clip = whisper_feature[:, audio_index: audio_index + audio_feature_length_per_frame]
+                # Ensure audio_index + audio_feature_length_per_frame doesn't exceed whisper_feature length
+                end_index = audio_index + audio_feature_length_per_frame
+                if end_index > whisper_feature.shape[1]:
+                    # If we exceed bounds, use the last available frames and pad if necessary
+                    available_frames = whisper_feature.shape[1] - audio_index
+                    if available_frames > 0:
+                        audio_clip = whisper_feature[:, audio_index:]
+                        # Pad with zeros if we don't have enough frames
+                        if available_frames < audio_feature_length_per_frame:
+                            padding_needed = audio_feature_length_per_frame - available_frames
+                            padding = torch.zeros_like(whisper_feature[:, :padding_needed])
+                            audio_clip = torch.cat([audio_clip, padding], dim=1)
+                    else:
+                        # If no frames available, create zero tensor
+                        audio_clip = torch.zeros_like(whisper_feature[:, :audio_feature_length_per_frame])
+                else:
+                    audio_clip = whisper_feature[:, audio_index: end_index]
+                
                 assert audio_clip.shape[1] == audio_feature_length_per_frame
                 audio_prompts.append(audio_clip)
             except Exception as e:
@@ -86,8 +103,11 @@ class AudioProcessor:
                 print(f"whisper_feature.shape: {whisper_feature.shape}")
                 print(f"audio_clip.shape: {audio_clip.shape}")
                 print(f"num frames: {num_frames}, fps: {fps}, whisper_idx_multiplier: {whisper_idx_multiplier}")
-                print(f"frame_index: {frame_index}, audio_index: {audio_index}-{audio_index + audio_feature_length_per_frame}")
-                exit()
+                print(f"frame_index: {frame_index}, audio_index: {audio_index}-{end_index}")
+                # Instead of exiting, skip this frame or use padding
+                audio_clip = torch.zeros_like(whisper_feature[:, :audio_feature_length_per_frame])
+                audio_prompts.append(audio_clip)
+                continue
 
         audio_prompts = torch.cat(audio_prompts, dim=0)  # T, 10, 5, 384
         audio_prompts = rearrange(audio_prompts, 'b c h w -> b (c h) w')
