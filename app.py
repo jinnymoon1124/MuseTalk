@@ -202,8 +202,8 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         "batch_size": 8, 
         "output_vid_name": '', 
         "use_saved_coord": False,
-        "audio_padding_length_left": 2,
-        "audio_padding_length_right": 2,
+        "audio_padding_length_left": 0,
+        "audio_padding_length_right": 0,
         "version": "v15",  # Fixed use v15 version
         "extra_margin": extra_margin,
         "parsing_mode": parsing_mode,
