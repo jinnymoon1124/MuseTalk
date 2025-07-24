@@ -128,6 +128,11 @@ CheckpointsDir = os.path.join(ProjectDir, "models")
 #             print(child_path)
 
 def download_model():
+    """
+    필수 모델 파일들의 존재 여부를 확인하는 함수
+    - MuseTalk, SD VAE, Whisper, DWPose, SyncNet, Face Parse, ResNet 모델들이 필요
+    - 누락된 모델이 있으면 다운로드 스크립트 실행을 안내
+    """
     # 检查必需的模型文件是否存在
     required_models = {
         "MuseTalk": f"{CheckpointsDir}/musetalkV15/unet.pth",
@@ -160,9 +165,10 @@ def download_model():
         print("All required model files exist.")
 
 
+# ==================== 앱 실행 시 초기화 및 필요한 모델들 로딩 ========================
 
-
-download_model()  # for huggingface deployment.
+# 모델 다운로드 확인
+download_model()   # 필수 모델 파일들 존재 여부 확인
 
 from musetalk.utils.blending import get_image
 from musetalk.utils.face_parsing import FaceParsing
@@ -172,6 +178,10 @@ from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord
 
 
 def fast_check_ffmpeg():
+    """
+    ffmpeg 설치 여부를 빠르게 확인하는 함수
+    - 비디오 처리에 필수적인 ffmpeg가 시스템에 설치되어 있는지 확인
+    """
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
         return True
@@ -182,7 +192,21 @@ def fast_check_ffmpeg():
 @torch.no_grad()
 def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
               left_cheek_width=90, right_cheek_width=90, progress=gr.Progress(track_tqdm=True)):
-    # Set default parameters, aligned with inference.py
+    """
+    메인 추론 함수 - 오디오와 비디오를 입력받아 말하는 얼굴을 생성
+    
+    동작 순서:
+    1. 파라미터 설정 및 초기화
+    2. 입력 비디오에서 프레임 추출
+    3. 오디오에서 특징 추출
+    4. 입력 이미지 전처리 (랜드마크 및 바운딩박스 추출)
+    5. 배치 단위로 추론 실행
+    6. 생성된 이미지를 원본 비디오에 합성
+    7. 최종 비디오 생성 및 오디오 합성
+    """
+    
+    # ===== 1단계: 파라미터 설정 및 초기화 =====
+    # inference.py와 동일한 기본 파라미터 설정
     args_dict = {
         "result_dir": './results/output', 
         "fps": 50, 
@@ -191,7 +215,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         "use_saved_coord": False,
         "audio_padding_length_left": 2,
         "audio_padding_length_right": 2,
-        "version": "v15",  # Fixed use v15 version
+        "version": "v15",  # v15 버전 고정 사용
         "extra_margin": extra_margin,
         "parsing_mode": parsing_mode,
         "left_cheek_width": left_cheek_width,
@@ -199,19 +223,20 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     }
     args = Namespace(**args_dict)
 
-    # Check ffmpeg
+    # ffmpeg 설치 여부 확인
     if not fast_check_ffmpeg():
         print("Warning: Unable to find ffmpeg, please ensure ffmpeg is properly installed")
 
+    # 출력 파일명 생성
     input_basename = os.path.basename(video_path).split('.')[0]
     audio_basename = os.path.basename(audio_path).split('.')[0]
     output_basename = f"{input_basename}_{audio_basename}"
     
-    # Create temporary directory
+    # 임시 디렉토리 생성
     temp_dir = os.path.join(args.result_dir, f"{args.version}")
     os.makedirs(temp_dir, exist_ok=True)
     
-    # Set result save path
+    # 결과 저장 경로 설정
     result_img_save_path = os.path.join(temp_dir, output_basename)
     crop_coord_save_path = os.path.join(args.result_dir, "../", input_basename+".pkl")
     os.makedirs(result_img_save_path, exist_ok=True)
@@ -221,25 +246,27 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     else:
         output_vid_name = os.path.join(temp_dir, args.output_vid_name)
         
-    ############################################## extract frames from source video ##############################################
+    # ===== 2단계: 입력 비디오에서 프레임 추출 =====
     if get_file_type(video_path) == "video":
+        # 비디오 파일인 경우: 프레임을 추출하여 이미지로 저장
         save_dir_full = os.path.join(temp_dir, input_basename)
         os.makedirs(save_dir_full, exist_ok=True)
-        # Read video
+        # 비디오 읽기
         reader = imageio.get_reader(video_path)
 
-        # Save images
+        # 각 프레임을 이미지로 저장
         for i, im in enumerate(reader):
             imageio.imwrite(f"{save_dir_full}/{i:08d}.png", im)
         input_img_list = sorted(glob.glob(os.path.join(save_dir_full, '*.[jpJP][pnPN]*[gG]')))
         fps = get_video_fps(video_path)
-    else: # input img folder
+    else: 
+        # 이미지 폴더인 경우: 기존 이미지 파일들을 사용
         input_img_list = glob.glob(os.path.join(video_path, '*.[jpJP][pnPN]*[gG]'))
         input_img_list = sorted(input_img_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
         fps = args.fps
         
-    ############################################## extract audio feature ##############################################
-    # Extract audio features
+    # ===== 3단계: 오디오에서 특징 추출 =====
+    # Whisper 모델을 사용하여 오디오에서 특징 추출
     whisper_input_features, librosa_length = audio_processor.get_audio_feature(audio_path)
     whisper_chunks = audio_processor.get_whisper_chunk(
         whisper_input_features, 
@@ -252,25 +279,29 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         audio_padding_length_right=args.audio_padding_length_right,
     )
         
-    ############################################## preprocess input image  ##############################################
+    # ===== 4단계: 입력 이미지 전처리 =====
     if os.path.exists(crop_coord_save_path) and args.use_saved_coord:
+        # 저장된 좌표가 있으면 재사용 (시간 절약)
         print("using extracted coordinates")
         with open(crop_coord_save_path,'rb') as f:
             coord_list = pickle.load(f)
         frame_list = read_imgs(input_img_list)
     else:
+        # 랜드마크 및 바운딩박스 추출 (시간이 오래 걸림)
         print("extracting landmarks...time consuming")
         coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
+        # 추출된 좌표를 파일로 저장 (다음 실행 시 재사용)
         with open(crop_coord_save_path, 'wb') as f:
             pickle.dump(coord_list, f)
     bbox_shift_text = get_bbox_range(input_img_list, bbox_shift)
     
-    # Initialize face parser
+    # 얼굴 파싱 모델 초기화
     fp = FaceParsing(
         left_cheek_width=args.left_cheek_width,
         right_cheek_width=args.right_cheek_width
     )
     
+    # ===== 5단계: 입력 이미지를 VAE 잠재 공간으로 변환 =====
     i = 0
     input_latent_list = []
     for bbox, frame in zip(coord_list, frame_list):
@@ -279,20 +310,23 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         x1, y1, x2, y2 = bbox
         y2 = y2 + args.extra_margin
         y2 = min(y2, frame.shape[0])
+        # 얼굴 영역을 크롭하고 256x256으로 리사이즈
         crop_frame = frame[y1:y2, x1:x2]
         crop_frame = cv2.resize(crop_frame,(256,256),interpolation = cv2.INTER_LANCZOS4)
+        # VAE를 사용하여 잠재 벡터로 변환
         latents = vae.get_latents_for_unet(crop_frame)
         input_latent_list.append(latents)
 
-    # to smooth the first and the last frame
+    # 첫 프레임과 마지막 프레임을 부드럽게 연결하기 위해 순환 리스트 생성
     frame_list_cycle = frame_list + frame_list[::-1]
     coord_list_cycle = coord_list + coord_list[::-1]
     input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
     
-    ############################################## inference batch by batch ##############################################
+    # ===== 6단계: 배치 단위로 추론 실행 =====
     print("start inference")
     video_num = len(whisper_chunks)
     batch_size = args.batch_size
+    # 데이터 생성기 초기화
     gen = datagen(
         whisper_chunks=whisper_chunks,
         vae_encode_latents=input_latent_list_cycle,
@@ -301,17 +335,21 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         device=device,
     )
     res_frame_list = []
+    # 배치 단위로 추론 실행
     for i, (whisper_batch,latent_batch) in enumerate(tqdm(gen,total=int(np.ceil(float(video_num)/batch_size)))):
+        # 오디오 특징을 위치 인코딩
         audio_feature_batch = pe(whisper_batch)
-        # Ensure latent_batch is consistent with model weight type
+        # 잠재 벡터를 모델 가중치 타입과 일치하도록 변환
         latent_batch = latent_batch.to(dtype=weight_dtype)
         
+        # UNet 모델을 사용하여 새로운 잠재 벡터 생성
         pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+        # VAE를 사용하여 잠재 벡터를 이미지로 디코딩
         recon = vae.decode_latents(pred_latents)
         for res_frame in recon:
             res_frame_list.append(res_frame)
             
-    ############################################## pad to full image ##############################################
+    # ===== 7단계: 생성된 이미지를 원본 비디오에 합성 =====
     print("pad talking image to original video")
     for i, res_frame in enumerate(tqdm(res_frame_list)):
         bbox = coord_list_cycle[i%(len(coord_list_cycle))]
@@ -320,25 +358,29 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         y2 = y2 + args.extra_margin
         y2 = min(y2, frame.shape[0])
         try:
+            # 생성된 이미지를 원본 크기로 리사이즈
             res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
         except:
             continue
         
-        # Use v15 version blending
+        # v15 버전 블렌딩을 사용하여 원본 이미지와 합성
         combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
             
+        # 합성된 프레임을 파일로 저장
         cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
         
-    # Frame rate
+    # ===== 8단계: 최종 비디오 생성 =====
+    # 프레임 레이트 설정
     fps = 50
-    # Output video path
+    # 임시 출력 비디오 경로
     output_video = 'temp.mp4'
 
-    # Read images
+    # 유효한 이미지 파일 필터링 함수
     def is_valid_image(file):
         pattern = re.compile(r'\d{8}\.png')
         return pattern.match(file)
 
+    # 저장된 이미지들을 읽어서 리스트로 변환
     images = []
     files = [file for file in os.listdir(result_img_save_path) if is_valid_image(file)]
     files.sort(key=lambda x: int(x.split('.')[0]))
@@ -348,17 +390,18 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         images.append(imageio.imread(filename))
         
 
-    # Save video
+    # 이미지들을 비디오로 저장
     imageio.mimwrite(output_video, images, 'FFMPEG', fps=fps, codec='libx264', pixelformat='yuv420p')
 
+    # ===== 9단계: 오디오와 비디오 합성 =====
     input_video = './temp.mp4'
-    # Check if the input_video and audio_path exist
+    # 입력 비디오와 오디오 파일 존재 여부 확인
     if not os.path.exists(input_video):
         raise FileNotFoundError(f"Input video file not found: {input_video}")
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
     
-    # Read video
+    # 비디오 정보 읽기
     reader = imageio.get_reader(input_video)
     fps = reader.get_meta_data()['fps']  # Get original video frame rate
     reader.close() # Otherwise, error on win11: PermissionError: [WinError 32] Another program is using this file, process cannot access. : 'temp.mp4'
@@ -367,18 +410,19 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     
     print(len(frames))
 
-    # Load the video
+    # 비디오 클립 로드
     video_clip = VideoFileClip(input_video)
 
-    # Load the audio
+    # 오디오 클립 로드
     audio_clip = AudioFileClip(audio_path)
 
-    # Set the audio to the video
+    # 비디오에 오디오 설정
     video_clip = video_clip.set_audio(audio_clip)
 
-    # Write the output video
+    # 최종 비디오 파일로 저장
     video_clip.write_videofile(output_vid_name, codec='libx264', audio_codec='aac',fps=50)
 
+    # 임시 파일 정리
     os.remove("temp.mp4")
     #shutil.rmtree(result_img_save_path)
     print(f"result is save to {output_vid_name}")
@@ -386,10 +430,12 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
 
 
 
-# load model weights
+# 1번쨰 gpu 사용하도록 임시 지정
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 print(f"=============== Using device: {device} ================")
+
+# 모든 모델 로드 (VAE, UNet, Position Encoder)
 vae, unet, pe = load_all_model(
     unet_model_path="./models/musetalkV15/unet.pth", 
     vae_type="sd-vae",
@@ -397,7 +443,7 @@ vae, unet, pe = load_all_model(
     device=device
 )
 
-# Parse command line arguments
+# ===== 명령행 인수 파싱 =====
 parser = argparse.ArgumentParser()
 parser.add_argument("--ffmpeg_path", type=str, default=r"ffmpeg-master-latest-win64-gpl-shared\bin", help="Path to ffmpeg executable")
 parser.add_argument("--ip", type=str, default="127.0.0.1", help="IP address to bind to")
@@ -406,9 +452,9 @@ parser.add_argument("--share", action="store_true", help="Create a public link")
 parser.add_argument("--use_float16", action="store_true", help="Use float16 for faster inference")
 args = parser.parse_args()
 
-# Set data type
+# ===== 데이터 타입 설정 =====
 if args.use_float16:
-    # Convert models to half precision for better performance
+    # float16을 사용하여 더 빠른 추론을 위해 모델을 반정밀도로 변환
     pe = pe.half()
     vae.vae = vae.vae.half()
     unet.model = unet.model.half()
@@ -416,14 +462,15 @@ if args.use_float16:
 else:
     weight_dtype = torch.float32
 
-# Move models to specified device
+# ===== 모델을 지정된 디바이스로 이동 =====
 pe = pe.to(device)
 vae.vae = vae.vae.to(device)
 unet.model = unet.model.to(device)
 
+# 타임스텝 설정 (확산 모델에서 사용)
 timesteps = torch.tensor([0], device=device)
 
-# Initialize audio processor and Whisper model
+# ===== 오디오 프로세서 및 Whisper 모델 초기화 =====
 audio_processor = AudioProcessor(feature_extractor_path="./models/whisper")
 whisper = WhisperModel.from_pretrained("./models/whisper")
 whisper = whisper.to(device=device, dtype=weight_dtype).eval()
@@ -431,28 +478,37 @@ whisper.requires_grad_(False)
 
 
 def check_video(video):
+    """
+    입력 비디오를 처리하여 50fps로 변환하는 함수
+    
+    동작 과정:
+    1. 이미 처리된 비디오인지 확인
+    2. 비디오를 프레임 단위로 분해
+    3. 50fps로 리샘플링
+    4. 새로운 비디오로 저장
+    """
     if not isinstance(video, str):
-        return video # in case of none type
-    # Define the output video file name
+        return video # none 타입인 경우
+    # 출력 비디오 파일명 정의
     dir_path, file_name = os.path.split(video)
     if file_name.startswith("outputxxx_"):
         return video
-    # Add the output prefix to the file name
+    # 파일명에 출력 접두사 추가
     output_file_name = "outputxxx_" + file_name
 
+    # 결과 디렉토리 생성
     os.makedirs('./results',exist_ok=True)
     os.makedirs('./results/output',exist_ok=True)
     os.makedirs('./results/input',exist_ok=True)
 
-    # Combine the directory path and the new file name
+    # 디렉토리 경로와 새 파일명 결합
     output_video = os.path.join('./results/input', output_file_name)
 
-
-    # read video
+    # 비디오 읽기
     reader = imageio.get_reader(video)
-    fps = reader.get_meta_data()['fps']  # get fps from original video
+    fps = reader.get_meta_data()['fps']  # 원본 비디오에서 fps 가져오기
 
-    # conver fps to 50
+    # fps를 50으로 변환
     frames = [im for im in reader]
     target_fps = 50
     
@@ -463,37 +519,33 @@ def check_video(video):
     target_frames = []
     for target_t in range(1, L_target+1):
         while target_t / target_fps > original_t[t_idx]:
-            t_idx += 1      # find the first t_idx so that target_t / target_fps <= original_t[t_idx]
+            t_idx += 1      # target_t / target_fps <= original_t[t_idx]인 첫 번째 t_idx 찾기
             if t_idx >= L:
                 break
         target_frames.append(frames[t_idx])
 
-    # save video
+    # 비디오 저장
     imageio.mimwrite(output_video, target_frames, 'FFMPEG', fps=50, codec='libx264', quality=9, pixelformat='yuv420p')
     return output_video
 
 
 
 
+# ===== Gradio UI CSS 스타일 =====
 css = """#input_img {max-width: 1024px !important} #output_vid {max-width: 1024px; max-height: 576px}"""
 
+# ===== Gradio 웹 인터페이스 구성 =====
 with gr.Blocks(css=css) as demo:
-    gr.Markdown(
-        """<div align='center'> <h1>MuseTalk: Real-Time High-Fidelity Video Dubbing via Spatio-Temporal Sampling</h1> \
-                <a style='font-size:18px;color: #000000' href='https://github.com/TMElyralab/MuseTalk'>[Github Repo]</a>\
-                <a style='font-size:18px;color: #000000' href='https://github.com/TMElyralab/MuseTalk'>[Huggingface]</a>\
-                <a style='font-size:18px;color: #000000' href='https://arxiv.org/abs/2410.10122'> [Technical report] </a>"""
-    )
-
     with gr.Row():
         with gr.Column():
-            audio = gr.Audio(label="Drving Audio",type="filepath")
-            video = gr.Video(label="Reference Video",sources=['upload'])
-            bbox_shift = gr.Number(label="BBox_shift value, px", value=0)
-            extra_margin = gr.Slider(label="Extra Margin", minimum=0, maximum=400, value=0, step=1)
-            parsing_mode = gr.Radio(label="Parsing Mode", choices=["jaw", "raw"], value="jaw")
-            left_cheek_width = gr.Slider(label="Left Cheek Width", minimum=0, maximum=200, value=20, step=1)
-            right_cheek_width = gr.Slider(label="Right Cheek Width", minimum=0, maximum=200, value=20, step=1)
+            # 입력 컴포넌트들
+            audio = gr.Audio(label="Drving Audio",type="filepath")  # 오디오 입력
+            video = gr.Video(label="Reference Video",sources=['upload'])  # 비디오 입력
+            bbox_shift = gr.Number(label="BBox_shift value, px", value=0)  # 바운딩박스 이동값
+            extra_margin = gr.Slider(label="Extra Margin", minimum=0, maximum=400, value=0, step=1)  # 추가 여백
+            parsing_mode = gr.Radio(label="Parsing Mode", choices=["jaw", "raw"], value="jaw")  # 파싱 모드
+            left_cheek_width = gr.Slider(label="Left Cheek Width", minimum=0, maximum=200, value=20, step=1)  # 왼쪽 볼 너비
+            right_cheek_width = gr.Slider(label="Right Cheek Width", minimum=0, maximum=200, value=20, step=1)  # 오른쪽 볼 너비
             bbox_shift_scale = gr.Textbox(label="'left_cheek_width' and 'right_cheek_width' parameters determine the range of left and right cheeks editing when parsing model is 'jaw'. The 'extra_margin' parameter determines the movement range of the jaw. Users can freely adjust these three parameters to obtain better inpainting results.")
 
             with gr.Row():
@@ -504,9 +556,11 @@ with gr.Blocks(css=css) as demo:
             # debug_info = gr.Textbox(label="Parameter Information", lines=5)
             out1 = gr.Video()
     
+    # 비디오 변경 시 자동으로 50fps로 변환
     video.change(
         fn=check_video, inputs=[video], outputs=[video]
     )
+    # 생성 버튼 클릭 시 추론 실행
     btn.click(
         fn=inference,
         inputs=[
@@ -547,7 +601,7 @@ with gr.Blocks(css=css) as demo:
 #     import asyncio
 #     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# Start Gradio application
+# ===== Gradio 애플리케이션 시작 =====
 demo.queue().launch(
     share=args.share, 
     debug=True, 
