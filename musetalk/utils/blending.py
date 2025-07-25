@@ -107,10 +107,10 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
                 mask_image = Image.fromarray(smart_mask)
                 
                 # 디버그용 시각화 저장 (선택사항)
-                # debug_vis = occlusion_detector.visualize_occlusion_detection(
-                #     original_image_np, mask_array_initial, smart_mask, jaw_bbox,
-                #     save_path="./results/debug/smart_occlusion_debug.png"
-                # )
+                debug_vis = occlusion_detector.visualize_occlusion_detection(
+                    original_image_np, mask_array_initial, smart_mask, jaw_bbox,
+                    save_path="./results/debug/smart_occlusion_debug.png"
+                )
             else:
                 print("가림 감지되지 않음 - 원본 마스크 사용")
             

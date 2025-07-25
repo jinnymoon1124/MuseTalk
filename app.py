@@ -254,8 +254,8 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         "batch_size": 8, 
         "output_vid_name": '', 
         "use_saved_coord": False,
-        "audio_padding_length_left": 2,
-        "audio_padding_length_right": 2,
+        "audio_padding_length_left": 0,
+        "audio_padding_length_right": 0,
         "version": "v15",  # v15 버전 고정 사용
         "extra_margin": extra_margin,
         "parsing_mode": parsing_mode,
@@ -308,16 +308,28 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         
     # ===== 3단계: 오디오에서 특징 추출 =====
     # Whisper 모델을 사용하여 오디오에서 특징 추출
+    # 이 단계는 립싱크의 핵심입니다 - 음성의 특징을 분석하여 입술 움직임을 예측할 수 있는 정보를 추출합니다
+    
+    # 1. 음성 파일을 AI가 이해할 수 있는 형태로 변환
+    # - 음성 파일을 읽어서 16kHz로 변환 (표준 주파수)
+    # - 30초씩 나누어서 처리 (AI 모델이 한 번에 처리할 수 있는 최적 길이)
+    # - 각 구간을 숫자 형태로 변환 (AI가 이해할 수 있는 형태)
     whisper_input_features, librosa_length = audio_processor.get_audio_feature(audio_path)
+    
+    # 2. 음성 특징을 비디오 프레임과 동기화
+    # - 비디오는 1초에 50장의 이미지(프레임)로 구성됩니다
+    # - 음성도 같은 시간에 맞춰서 50개 구간으로 나눕니다
+    # - 각 프레임마다 해당 시간의 음성 특징을 제공합니다
+    # - 이렇게 하면 "이 시간에 이런 소리가 나면 입술이 이렇게 움직여야 한다"는 정보를 얻을 수 있습니다
     whisper_chunks = audio_processor.get_whisper_chunk(
-        whisper_input_features, 
-        device, 
-        weight_dtype, 
-        whisper, 
-        librosa_length,
-        fps=fps,
-        audio_padding_length_left=args.audio_padding_length_left,
-        audio_padding_length_right=args.audio_padding_length_right,
+        whisper_input_features,  # 변환된 음성 특징들
+        device,                  # GPU 또는 CPU 사용 여부
+        weight_dtype,            # 데이터 타입 (float16 또는 float32)
+        whisper,                 # Whisper AI 모델
+        librosa_length,          # 전체 음성 길이
+        fps=fps,                 # 비디오 프레임 레이트 (초당 프레임 수)
+        audio_padding_length_left=args.audio_padding_length_left,    # 왼쪽 패딩 (이전 프레임과의 연결)
+        audio_padding_length_right=args.audio_padding_length_right,  # 오른쪽 패딩 (다음 프레임과의 연결)
     )
         
     # ===== 4단계: 입력 이미지 전처리 =====
@@ -367,76 +379,106 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     print("start inference")
     video_num = len(whisper_chunks)
     batch_size = args.batch_size
+    
     # 데이터 생성기 초기화
+    # 이 생성기는 음성 특징과 이미지 특징을 함께 제공하여 AI 모델이 처리할 수 있도록 합니다
     gen = datagen(
-        whisper_chunks=whisper_chunks,
-        vae_encode_latents=input_latent_list_cycle,
-        batch_size=batch_size,
-        delay_frame=0,
-        device=device,
+        whisper_chunks=whisper_chunks,        # 각 프레임에 해당하는 음성 특징들
+        vae_encode_latents=input_latent_list_cycle,  # 이미지를 숫자로 변환한 특징들
+        batch_size=batch_size,                # 한 번에 처리할 프레임 수 (메모리 효율성을 위해)
+        delay_frame=0,                        # 지연 프레임 (현재는 사용하지 않음)
+        device=device,                        # GPU 또는 CPU 사용 여부
     )
     res_frame_list = []
+    
     # 배치 단위로 추론 실행
+    # 이 부분이 실제 립싱크를 생성하는 핵심입니다!
     for i, (whisper_batch,latent_batch) in enumerate(tqdm(gen,total=int(np.ceil(float(video_num)/batch_size)))):
-        # 오디오 특징을 위치 인코딩
+        # 1. 오디오 특징을 위치 인코딩
+        # - 음성의 시간적 정보를 AI 모델이 이해할 수 있도록 변환
+        # - "이 시간에 이런 소리가 나고 있다"는 정보를 제공
         audio_feature_batch = pe(whisper_batch)
-        # 잠재 벡터를 모델 가중치 타입과 일치하도록 변환
+        
+        # 2. 잠재 벡터를 모델 가중치 타입과 일치하도록 변환
+        # - 이미지 특징을 AI 모델이 처리할 수 있는 형태로 변환
         latent_batch = latent_batch.to(dtype=weight_dtype)
         
-        # UNet 모델을 사용하여 새로운 잠재 벡터 생성
+        # 3. UNet 모델을 사용하여 새로운 잠재 벡터 생성
+        # - 이것이 실제 립싱크를 만드는 마법의 부분입니다!
+        # - AI 모델이 "이 음성에 맞는 입술 움직임"을 예측합니다
+        # - timesteps는 확산 모델에서 사용하는 시간 단계 (현재는 0으로 고정)
         pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
-        # VAE를 사용하여 잠재 벡터를 이미지로 디코딩
+        
+        # 4. VAE를 사용하여 잠재 벡터를 이미지로 디코딩
+        # - AI가 예측한 "숨겨진 특징"을 실제 이미지로 변환
+        # - 이제 입술이 움직인 새로운 얼굴 이미지가 생성됩니다
         recon = vae.decode_latents(pred_latents)
+        
+        # 5. 생성된 이미지들을 결과 리스트에 추가
         for res_frame in recon:
             res_frame_list.append(res_frame)
             
     # ===== 7단계: 생성된 이미지를 원본 비디오에 합성 =====
     print("pad talking image to original video")
     for i, res_frame in enumerate(tqdm(res_frame_list)):
+        # 1. 현재 프레임에 해당하는 얼굴 위치 정보 가져오기
+        # - 원본 비디오에서 얼굴이 어디에 있는지 알려주는 좌표
         bbox = coord_list_cycle[i%(len(coord_list_cycle))]
+        # - 원본 비디오의 현재 프레임 (배경, 머리카락, 옷 등이 포함된 전체 이미지)
         ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
-        x1, y1, x2, y2 = bbox
-        y2 = y2 + args.extra_margin
-        y2 = min(y2, frame.shape[0])
+        
+        # 2. 얼굴 영역의 좌표 추출
+        x1, y1, x2, y2 = bbox  # x1,y1: 왼쪽 위, x2,y2: 오른쪽 아래
+        y2 = y2 + args.extra_margin  # 턱 움직임을 위해 아래쪽 여백 추가
+        y2 = min(y2, frame.shape[0])  # 이미지 경계를 벗어나지 않도록 제한
+        
         try:
-            # 생성된 이미지를 원본 크기로 리사이즈
+            # 3. 생성된 얼굴 이미지를 원본 크기로 리사이즈
+            # - AI가 생성한 256x256 얼굴 이미지를 원본 얼굴 크기로 확대
             res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
         except:
             continue
         
-        # 가림 감지 기능을 포함한 v15 버전 블렌딩 사용
+        # 4. 가림 감지 기능을 포함한 v15 버전 블렌딩 사용
+        # - 이것이 강사 영상에 최적화된 핵심 기능입니다!
+        # - 마이크, 손, 머리카락 등에 의해 얼굴이 가려진 부분을 감지
+        # - 가려진 부분에서는 자연스럽게 원본을 유지하고, 보이는 부분만 립싱크 적용
         combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], 
                                  mode=args.parsing_mode, fp=fp,
                                  enable_occlusion_detection=enable_occlusion_detection,
                                  occlusion_sensitivity=occlusion_sensitivity)
-        # v15 버전 블렌딩을 사용하여 원본 이미지와 합성
-        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
-            
-        # 합성된 프레임을 파일로 저장
+        
+        # 5. 합성된 프레임을 파일로 저장
+        # - 각 프레임을 순서대로 저장하여 나중에 비디오로 만들기 위해 준비
         cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
         
     # ===== 8단계: 최종 비디오 생성 =====
-    # 프레임 레이트 설정
+    # 프레임 레이트 설정 (초당 50장의 이미지)
     fps = 50
     # 임시 출력 비디오 경로
     output_video = 'temp.mp4'
 
     # 유효한 이미지 파일 필터링 함수
+    # - 8자리 숫자로 된 PNG 파일만 선택 (예: 00000001.png, 00000002.png)
     def is_valid_image(file):
         pattern = re.compile(r'\d{8}\.png')
         return pattern.match(file)
 
     # 저장된 이미지들을 읽어서 리스트로 변환
     images = []
+    # 모든 이미지 파일을 찾아서 숫자 순서대로 정렬
     files = [file for file in os.listdir(result_img_save_path) if is_valid_image(file)]
     files.sort(key=lambda x: int(x.split('.')[0]))
 
+    # 각 이미지 파일을 순서대로 읽어서 리스트에 추가
     for file in files:
         filename = os.path.join(result_img_save_path, file)
         images.append(imageio.imread(filename))
         
 
     # 이미지들을 비디오로 저장
+    # - 여러 장의 이미지를 순서대로 재생하여 비디오로 만듭니다
+    # - FFMPEG 코덱을 사용하여 고품질 비디오 생성
     imageio.mimwrite(output_video, images, 'FFMPEG', fps=fps, codec='libx264', pixelformat='yuv420p')
 
     # ===== 9단계: 오디오와 비디오 합성 =====
@@ -449,28 +491,31 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     
     # 비디오 정보 읽기
     reader = imageio.get_reader(input_video)
-    fps = reader.get_meta_data()['fps']  # Get original video frame rate
-    reader.close() # Otherwise, error on win11: PermissionError: [WinError 32] Another program is using this file, process cannot access. : 'temp.mp4'
-    # Store frames in list
-    frames = images
+    fps = reader.get_meta_data()['fps']  # 원본 비디오의 프레임 레이트 가져오기
+    reader.close() # 윈도우에서 파일 사용 중 오류를 방지하기 위해 즉시 닫기
     
+    # 프레임 수 출력 (디버깅용)
     print(len(frames))
 
-    # 비디오 클립 로드
+    # 비디오 클립 로드 (moviepy 라이브러리 사용)
     video_clip = VideoFileClip(input_video)
 
-    # 오디오 클립 로드
+    # 오디오 클립 로드 (원본 음성 파일)
     audio_clip = AudioFileClip(audio_path)
 
     # 비디오에 오디오 설정
+    # - 이제 립싱크가 적용된 비디오에 원본 음성이 합성됩니다
     video_clip = video_clip.set_audio(audio_clip)
 
     # 최종 비디오 파일로 저장
+    # - libx264: 고품질 비디오 코덱
+    # - aac: 고품질 오디오 코덱
+    # - fps=50: 초당 50프레임으로 설정
     video_clip.write_videofile(output_vid_name, codec='libx264', audio_codec='aac',fps=50)
 
     # 임시 파일 정리
-    os.remove("temp.mp4")
-    #shutil.rmtree(result_img_save_path)
+    os.remove("temp.mp4")  # 임시 비디오 파일 삭제
+    #shutil.rmtree(result_img_save_path)  # 임시 이미지 폴더 삭제 (주석 처리됨)
     print(f"result is save to {output_vid_name}")
     return output_vid_name,bbox_shift_text
 
@@ -599,7 +644,7 @@ with gr.Blocks(css=css) as demo:
                 enable_occlusion_detection = gr.Checkbox(label="가림 감지 활성화 (Enable Occlusion Detection)", value=True)
                 occlusion_sensitivity = gr.Slider(label="가림 감지 민감도 (Occlusion Sensitivity)", 
                                                  minimum=0.1, maximum=1.0, value=0.3, step=0.1,
-                                                 info="값이 높을수록 더 민감하게 가림을 감지합니다")
+                                                 info="값이 낮을수록 더 민감하게 가림을 감지/값이 높을수록 덜 민감하게 가림을 감지")
             
             bbox_shift_scale = gr.Textbox(label="'left_cheek_width'와 'right_cheek_width' 파라미터는 파싱 모델이 'jaw'일 때 좌우 볼 편집 범위를 결정합니다. 'extra_margin' 파라미터는 턱의 움직임 범위를 결정합니다. 사용자는 이 세 파라미터를 자유롭게 조정하여 더 나은 인페인팅 결과를 얻을 수 있습니다. 가림 감지 기능은 마이크 등의 물체에 의해 얼굴이 가려진 부분에서 자연스러운 립싱크를 제공합니다.")
 

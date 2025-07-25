@@ -18,6 +18,10 @@ def load_all_model(
     unet_config=os.path.join("models", "musetalkV15", "musetalk.json"),
     device=None,
 ):
+    # 👉 모델 로딩 함수
+    # VAE: 이미지를 잠재공간으로 인코딩하거나 디코딩하는 역할
+    # UNet: 얼굴의 입 모양을 예측하는 네트워크
+    # PositionalEncoding: 시계열 정보(프레임 순서)를 추가해주는 역할
     vae = VAE(
         model_path = os.path.join("models", vae_type),
     )
@@ -47,6 +51,9 @@ def get_video_fps(video_path):
     return fps
 
 def datagen(
+    # 👉 음성 및 이미지 latent 데이터를 묶어 배치(batch)로 만듦
+    # whisper (음성 특징) + vae_encode_latents (이미지 latent) = 한 쌍의 입력
+    # 배치 사이즈만큼 묶어서 yield → 학습 또는 추론에 사용됨
     whisper_chunks,
     vae_encode_latents,
     batch_size=8,
@@ -100,7 +107,10 @@ def rand_log_normal(
     return sigma
 
 def get_mouth_region(frames, image_pred, pixel_values_face_mask):
-    # Initialize lists to store the results for each image in the batch
+    # 👉 얼굴 마스크 기준으로 입 주위 영역만 잘라냄
+    # 모델이 예측한 이미지 vs 원래 이미지에서 "입 부분만" 잘라내서 비교 가능
+    # 평가할 때 유용 (ex: 얼마나 비슷한 입 모양인지 등)
+
     mouth_real_list = []
     mouth_generated_list = []
 
@@ -143,6 +153,14 @@ def get_image_pred(pixel_values,
                    vae,
                    net,
                    weight_dtype):
+    # 👉 음성과 이미지 latent로 새로운 얼굴 이미지 생성
+    # 입력: 원본 이미지, 참조 이미지, 음성 정보
+    # 하단 마스킹 → VAE로 latent 추출
+    # 참조 이미지도 latent로 추출
+    # UNet에 concat해서 넣고, 예측 latent 얻기
+    # VAE로 다시 이미지를 복원
+    # 출력: 입 모양이 바뀐 예측 이미지
+
     with torch.no_grad():
         bsz, num_frames, c, h, w = pixel_values.shape
 
@@ -175,6 +193,10 @@ def get_image_pred(pixel_values,
     return image_pred
 
 def process_audio_features(cfg, batch, wav2vec, bsz, num_frames, weight_dtype):
+    # 👉 음성(예: wav2vec2)으로부터 프레임별 음성 특징 추출
+    # 각 프레임에 맞는 오디오 특징(길이 고려) 생성
+    # 결과는 [배치, 프레임수, 채널, 시간, 특징벡터] 구조로 나옴
+
     with torch.no_grad():
         audio_feature_length_per_frame = 2 * \
             (cfg.data.audio_padding_length_left +
@@ -204,6 +226,10 @@ def process_audio_features(cfg, batch, wav2vec, bsz, num_frames, weight_dtype):
     return audio_prompts
 
 def save_checkpoint(model, save_dir, ckpt_num, name="appearance_net", total_limit=None, logger=None):
+    # 👉 모델 저장 (학습 중간이나 추론 후)
+    # .pth 파일로 저장
+    # 총 개수 제한도 가능 (이전 체크포인트 자동 삭제)
+
     save_path = os.path.join(save_dir, f"{name}-{ckpt_num}.pth")
 
     if total_limit is not None:
@@ -232,6 +258,10 @@ def save_checkpoint(model, save_dir, ckpt_num, name="appearance_net", total_limi
     torch.save(state_dict, save_path)
 
 def save_models(accelerator, net, save_dir, global_step, cfg, logger=None):
+    # 👉 모델 저장 (학습 중간이나 추론 후)
+    # .pth 파일로 저장
+    # 총 개수 제한도 가능 (이전 체크포인트 자동 삭제)
+
     unwarp_net = accelerator.unwrap_model(net)
     save_checkpoint(
         unwarp_net.unet,
@@ -277,6 +307,15 @@ def process_and_save_images(
     num_images_to_keep=10,
     syncnet_score=1
 ):
+    # 👉 입력 / 참조 / 예측 / 원본 등 이미지를 하나로 이어서 저장
+    # 이미지 5개를 이어붙임:
+    # 마스킹된 입력
+    # 참조 이미지
+    # 모델이 예측한 이미지
+    # 원래 이미지
+    # 최종 추론 결과
+    # 이어 붙인 결과를 sample_*.jpg로 저장
+    
     # Rearrange the tensors
     print("image_pred.shape: ", image_pred.shape)
     pixel_values_ref_img = rearrange(batch['pixel_values_ref_img'], "b f c h w -> (b f) c h w")
