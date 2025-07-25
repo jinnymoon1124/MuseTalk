@@ -83,6 +83,15 @@ class OcclusionDetector:
         if jaw_mask.sum() == 0:
             return 0.0
             
+        # 배열 크기 검증 및 조정
+        if jaw_region.shape[:2] != jaw_mask.shape[:2]:
+            print(f"크기 불일치 감지: jaw_region {jaw_region.shape}, jaw_mask {jaw_mask.shape}")
+            # 더 작은 크기에 맞춰 조정
+            min_h = min(jaw_region.shape[0], jaw_mask.shape[0])
+            min_w = min(jaw_region.shape[1], jaw_mask.shape[1])
+            jaw_region = jaw_region[:min_h, :min_w]
+            jaw_mask = jaw_mask[:min_h, :min_w]
+            
         # 마스크 영역의 평균 색상 계산
         masked_region = jaw_region[jaw_mask > 0]
         if len(masked_region) == 0:
