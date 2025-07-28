@@ -104,9 +104,9 @@ def get_bbox_range(img_list, upperbondrange=0):
     landmarks = []
     
     if upperbondrange != 0:
-        print('get key_landmark and face bounding boxes with the bbox_shift:', upperbondrange)
+        print('get_bbox_range(if): get key_landmark and face bounding boxes with the bbox_shift:', upperbondrange)
     else:
-        print('get key_landmark and face bounding boxes with the default value')
+        print('get_bbox_range(else): get key_landmark and face bounding boxes with the default value')
     
     average_range_minus = []  # 위쪽 조정 범위들의 평균
     average_range_plus = []   # 아래쪽 조정 범위들의 평균
@@ -178,9 +178,9 @@ def get_landmark_and_bbox(img_list, upperbondrange=0):
     landmarks = []
     
     if upperbondrange != 0:
-        print('get key_landmark and face bounding boxes with the bbox_shift:', upperbondrange)
+        print('get_landmark_and_bbox(if): get key_landmark and face bounding boxes with the bbox_shift:', upperbondrange)
     else:
-        print('get key_landmark and face bounding boxes with the default value')
+        print('get_landmark_and_bbox(else): get key_landmark and face bounding boxes with the default value')
     
     average_range_minus = []
     average_range_plus = []

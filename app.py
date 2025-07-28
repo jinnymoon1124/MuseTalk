@@ -401,6 +401,11 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
             
     # ===== 7단계: 생성된 이미지를 원본 비디오에 합성 =====
     print("pad talking image to original video")
+    
+    # 가림 감지 비교 이미지 저장을 위한 디렉토리 생성
+    check_dir = "./results/check"
+    os.makedirs(check_dir, exist_ok=True)
+    
     for i, res_frame in enumerate(tqdm(res_frame_list)):
         # 1. 현재 프레임에 해당하는 얼굴 위치 정보 가져오기
         # - 원본 비디오에서 얼굴이 어디에 있는지 알려주는 좌표
@@ -420,14 +425,40 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         except:
             continue
         
-        # 4. 가림 감지 기능을 포함한 v15 버전 블렌딩 사용
-        # - 이것이 강사 영상에 최적화된 핵심 기능입니다!
-        # - 마이크, 손, 머리카락 등에 의해 얼굴이 가려진 부분을 감지
-        # - 가려진 부분에서는 자연스럽게 원본을 유지하고, 보이는 부분만 립싱크 적용
+        # 4-1. 진짜 처리 전 이미지 생성 (원본 + 생성된 얼굴만 단순 합성)
+        # - 가림 감지, 얼굴 파싱, 블러 등 모든 처리 없이 단순 합성
+        combine_frame_raw = ori_frame.copy()
+        combine_frame_raw[y1:y2, x1:x2] = res_frame  # 단순 픽셀 대체
+
+        # 4-2. 가림 감지 없는 기본 블렌딩 (얼굴 파싱 + 블러 적용)
+        combine_frame_before = get_image(ori_frame, res_frame, [x1, y1, x2, y2], 
+                                        mode=args.parsing_mode, fp=fp,
+                                        enable_occlusion_detection=False,
+                                        occlusion_sensitivity=0.3)
+
+        # 4-3. 가림 감지 기능을 포함한 v15 버전 블렌딩 사용
         combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], 
                                  mode=args.parsing_mode, fp=fp,
                                  enable_occlusion_detection=enable_occlusion_detection,
                                  occlusion_sensitivity=occlusion_sensitivity)
+
+        # 4-4. 가림 감지 비교 이미지 저장 (더 자세한 비교를 위해)
+        if i % 50 == 0 or i < 10:
+            # 1) 완전 원본 (처리 전)
+            cv2.imwrite(f"{check_dir}/frame_{str(i).zfill(8)}_0_original.png", 
+                       cv2.cvtColor(ori_frame, cv2.COLOR_RGB2BGR))
+            
+            # 2) 단순 합성 (얼굴만 대체)
+            cv2.imwrite(f"{check_dir}/frame_{str(i).zfill(8)}_1_raw_replace.png", 
+                       cv2.cvtColor(combine_frame_raw, cv2.COLOR_RGB2BGR))
+            
+            # 3) 기본 블렌딩 (가림 감지 없음)
+            cv2.imwrite(f"{check_dir}/frame_{str(i).zfill(8)}_2_basic_blending.png", 
+                       cv2.cvtColor(combine_frame_before, cv2.COLOR_RGB2BGR))
+            
+            # 4) 가림 감지 적용
+            cv2.imwrite(f"{check_dir}/frame_{str(i).zfill(8)}_3_occlusion_aware.png", 
+                       cv2.cvtColor(combine_frame, cv2.COLOR_RGB2BGR))
         
         # 5. 합성된 프레임을 파일로 저장
         # - 각 프레임을 순서대로 저장하여 나중에 비디오로 만들기 위해 준비

@@ -97,8 +97,8 @@ class OcclusionDetector:
         if len(masked_region) == 0:
             return 0.0
             
-        # HSV 색공간으로 변환하여 피부색 범위 확인
-        hsv_region = cv2.cvtColor(jaw_region, cv2.COLOR_BGR2HSV)
+        # HSV 색공간으로 변환하여 피부색 범위 확인 (RGB 입력이므로 RGB2HSV 사용)
+        hsv_region = cv2.cvtColor(jaw_region, cv2.COLOR_RGB2HSV)
         masked_hsv = hsv_region[jaw_mask > 0]
         
         # 피부색 범위 정의 (HSV)
@@ -186,7 +186,7 @@ class OcclusionDetector:
         jaw_mask_region = original_mask[y1:y2, x1:x2]
         
         # 색상 기반으로 가려진 픽셀 식별
-        hsv_jaw = cv2.cvtColor(jaw_region, cv2.COLOR_BGR2HSV)
+        hsv_jaw = cv2.cvtColor(jaw_region, cv2.COLOR_RGB2HSV)
         
         # 가림 정도를 점진적으로 계산하는 마스크 생성
         occlusion_confidence = np.zeros_like(jaw_mask_region, dtype=np.float32)
@@ -310,9 +310,9 @@ class OcclusionDetector:
                 jaw_region = jaw_region[:min_h, :min_w]
                 jaw_mask_region = jaw_mask_region[:min_h, :min_w]
             
-            # BGR 형식 확인 및 HSV 변환
+            # RGB 형식 확인 및 HSV 변환
             if len(jaw_region.shape) == 3 and jaw_region.shape[2] == 3:
-                hsv_jaw = cv2.cvtColor(jaw_region.astype(np.uint8), cv2.COLOR_BGR2HSV)
+                hsv_jaw = cv2.cvtColor(jaw_region.astype(np.uint8), cv2.COLOR_RGB2HSV)
             else:
                 print("색공간 변환 실패 - 원본 마스크 사용")
                 return original_mask
@@ -328,23 +328,22 @@ class OcclusionDetector:
                     try:
                         h, s, v = hsv_jaw[i, j]
                         
-                        # 매우 관대한 기준: 극단적으로 어둡거나 명백한 금속성이 아닌 이상 보존
-                        # 마이크 감지를 위한 더 정확한 조건
+                        # 더 적극적인 마이크 감지 기준
                         is_microphone = (
-                            (v < 20) or  # 매우 어두운 경우 (그림자/검은 마이크)
-                            (h > 90 and h < 130 and s > 150 and v < 100) or  # 금속성 파란색/회색
-                            (s < 30 and v < 50)  # 무채색이면서 어두운 경우
+                            (v < 50) or  # 어두운 경우 (20 → 50으로 증가)
+                            (h > 80 and h < 140 and s > 100 and v < 120) or  # 금속성 색상 범위 확대
+                            (s < 50 and v < 80)  # 무채색 기준 완화
                         )
                         
                         if not is_microphone:
                             # 마이크가 아닌 것으로 판단되면 입 영역은 최소 70% 이상 보존
                             current_value = adapted_mask[y1+i, x1+j]
-                            min_value = int(original_mask[y1+i, x1+j] * 0.7)  # 70% 보존
+                            min_value = int(original_mask[y1+i, x1+j] * 0.3)  # 70% → 30%로 감소
                             smart_mask[y1+i, x1+j] = max(current_value, min_value)
                         else:
                             # 마이크로 판단되면 adapted_mask 값 사용 (하지만 완전 제거는 하지 않음)
                             current_value = adapted_mask[y1+i, x1+j]
-                            min_value = int(original_mask[y1+i, x1+j] * 0.2)  # 최소 20% 보존
+                            min_value = int(original_mask[y1+i, x1+j] * 0.05)  # 20% → 5%로 감소
                             smart_mask[y1+i, x1+j] = max(current_value, min_value)
                             
                     except (IndexError, ValueError) as e:
@@ -383,7 +382,7 @@ class OcclusionDetector:
             
             # HSV 변환
             if len(jaw_region.shape) == 3 and jaw_region.shape[2] == 3:
-                hsv_jaw = cv2.cvtColor(jaw_region.astype(np.uint8), cv2.COLOR_BGR2HSV)
+                hsv_jaw = cv2.cvtColor(jaw_region.astype(np.uint8), cv2.COLOR_RGB2HSV)
             else:
                 return original_mask
             

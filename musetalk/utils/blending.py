@@ -37,8 +37,6 @@ def face_seg(image, mode="raw", fp=None):
 def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode="raw", fp=None, 
               enable_occlusion_detection=True, occlusion_sensitivity=0.3):
     """
-    将裁剪的面部图像粘贴回原始图像，并进行一些处理。
-
     Args:
         image (numpy.ndarray): 원본 이미지（신체 부분）。
         face (numpy.ndarray): 잘린 얼굴 이미지。
@@ -60,9 +58,10 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
     # 원본 이미지 형태 보존을 위한 복사본 생성
     original_image_backup = image.copy()
     
-    # numpy 배열을 PIL 이미지로 변환 (색공간 변환 최소화)
-    body = Image.fromarray(image[:, :, ::-1])  # 신체 부분 이미지(전체 이미지)
-    face = Image.fromarray(face[:, :, ::-1])  # 얼굴 이미지
+    # numpy 배열을 PIL 이미지로 변환 (RGB 형식 그대로 사용)
+    # 입력 이미지가 이미 RGB 형식이므로 색공간 변환 없이 직접 사용
+    body = Image.fromarray(image.astype(np.uint8))  # 신체 부분 이미지(전체 이미지)
+    face = Image.fromarray(face.astype(np.uint8))  # 얼굴 이미지
 
     x, y, x1, y1 = face_box  # 얼굴 경계상자의 좌표 가져오기
     crop_box, s = get_crop_box(face_box, expand)  # 확장된 자르기 상자 계산
@@ -88,12 +87,12 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
             # 가림 감지기 초기화
             occlusion_detector = OcclusionDetector(sensitivity_threshold=occlusion_sensitivity)
             
-            # 색공간 변환을 안정적으로 처리
+            # 색공간 변환을 안정적으로 처리 (이미 RGB 형식이므로 변환 불필요)
             original_image_np = np.array(body)
-            # BGR 변환 시 데이터 타입 보존
+            # 데이터 타입 보존
             if original_image_np.dtype != np.uint8:
                 original_image_np = original_image_np.astype(np.uint8)
-            original_image_np = original_image_np[:, :, ::-1]  # RGB to BGR
+            # RGB 형식 그대로 사용 (BGR 변환 제거)
             
             mask_array_initial = np.array(mask_image)
             
@@ -107,7 +106,7 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
             )
             
             if is_occluded:
-                print("가림 감지됨 - 스마트 립싱크 마스크 적용")
+                # print("가림 감지됨 - 스마트 립싱크 마스크 적용")
                 
                 # 색상 보존을 위한 보수적 스마트 마스크 생성
                 smart_mask = occlusion_detector.create_smart_lip_sync_mask(
@@ -123,7 +122,7 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
                     mask_image = Image.fromarray(mask_array_initial)
                 else:
                     mask_image = Image.fromarray(smart_mask)
-                    print(f"스마트 마스크 적용 완료 (변화율: {mask_change_ratio:.2f})")
+                    # print(f"스마트 마스크 적용 완료 (변화율: {mask_change_ratio:.2f})")
                 
                 # 디버그용 시각화 저장 (선택사항)
                 # debug_vis = occlusion_detector.visualize_occlusion_detection(
@@ -182,12 +181,12 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
     if result.dtype != np.uint8:
         result = np.clip(result, 0, 255).astype(np.uint8)
     
-    return result[:, :, ::-1]  # 처리된 이미지 반환（BGR에서 RGB로 변환）
+    return result  # 처리된 이미지 반환 (이미 RGB 형식이므로 변환 불필요)
 
 
 def get_image_blending(image, face, face_box, mask_array, crop_box):
-    body = Image.fromarray(image[:,:,::-1])
-    face = Image.fromarray(face[:,:,::-1])
+    body = Image.fromarray(image.astype(np.uint8))  # RGB 형식 그대로 사용
+    face = Image.fromarray(face.astype(np.uint8))  # RGB 형식 그대로 사용
 
     x, y, x1, y1 = face_box
     x_s, y_s, x_e, y_e = crop_box
@@ -198,7 +197,7 @@ def get_image_blending(image, face, face_box, mask_array, crop_box):
     face_large.paste(face, (x-x_s, y-y_s, x1-x_s, y1-y_s))
     body.paste(face_large, crop_box[:2], mask_image)
     body = np.array(body)
-    return body[:,:,::-1]
+    return body  # RGB 형식 그대로 반환
 
 
 def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand=1.5, fp=None, mode="raw"):
