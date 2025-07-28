@@ -263,6 +263,7 @@ class OcclusionDetector:
         """
         립싱크를 위한 스마트 마스크 생성
         입 영역은 최대한 보존하되, 명백히 가려진 부분만 제외
+        색상 보존을 위해 보수적 접근 방식 사용
         
         Args:
             original_mask: 원본 마스크
@@ -286,24 +287,128 @@ class OcclusionDetector:
         # 일반 적응적 마스크 생성
         adapted_mask = self._create_adaptive_mask(original_mask, jaw_region, jaw_bbox)
         
+        # 색상 보존을 위한 안전장치: 변화가 과도하면 원본 유지
+        original_area = np.sum(original_mask > 0)
+        adapted_area = np.sum(adapted_mask > 0)
+        
+        if original_area > 0:
+            change_ratio = adapted_area / original_area
+            if change_ratio < 0.4:  # 60% 이상 감소하면 보수적 접근
+                print(f"마스크 변화가 과도함 (보존율: {change_ratio:.2f}) - 보수적 마스크 적용")
+                # 매우 보수적인 마스크 생성
+                return self._create_conservative_mask(original_mask, jaw_region, jaw_bbox)
+        
         # 입 영역에서는 더 관대한 기준 적용
         jaw_mask_region = original_mask[y1:y2, x1:x2]
-        hsv_jaw = cv2.cvtColor(jaw_region, cv2.COLOR_BGR2HSV)
         
+        # 색공간 변환 시 안정성 확보
+        try:
+            if jaw_region.shape[:2] != jaw_mask_region.shape[:2]:
+                # 크기 불일치 시 안전하게 처리
+                min_h = min(jaw_region.shape[0], jaw_mask_region.shape[0])
+                min_w = min(jaw_region.shape[1], jaw_mask_region.shape[1])
+                jaw_region = jaw_region[:min_h, :min_w]
+                jaw_mask_region = jaw_mask_region[:min_h, :min_w]
+            
+            # BGR 형식 확인 및 HSV 변환
+            if len(jaw_region.shape) == 3 and jaw_region.shape[2] == 3:
+                hsv_jaw = cv2.cvtColor(jaw_region.astype(np.uint8), cv2.COLOR_BGR2HSV)
+            else:
+                print("색공간 변환 실패 - 원본 마스크 사용")
+                return original_mask
+                
+        except Exception as e:
+            print(f"HSV 변환 중 오류: {e} - 원본 마스크 사용")
+            return original_mask
+        
+        # 입 영역에서 매우 보수적인 기준 적용
         for i in range(max(0, lip_y1-y1), min(jaw_mask_region.shape[0], lip_y2-y1)):
             for j in range(max(0, lip_x1-x1), min(jaw_mask_region.shape[1], lip_x2-x1)):
                 if jaw_mask_region[i, j] > 0:
-                    h, s, v = hsv_jaw[i, j]
-                    
-                    # 입 영역에서는 더 관대한 기준 사용
-                    # 매우 어둡거나 명백히 금속성이 아닌 이상 보존
-                    if v > 30 and not (h > 100 and s > 200):  # 매우 관대한 기준
-                        # 입 영역은 최소 50% 이상 마스크 강도 유지
-                        current_value = adapted_mask[y1+i, x1+j]
-                        min_value = int(original_mask[y1+i, x1+j] * 0.5)
-                        smart_mask[y1+i, x1+j] = max(current_value, min_value)
+                    try:
+                        h, s, v = hsv_jaw[i, j]
+                        
+                        # 매우 관대한 기준: 극단적으로 어둡거나 명백한 금속성이 아닌 이상 보존
+                        # 마이크 감지를 위한 더 정확한 조건
+                        is_microphone = (
+                            (v < 20) or  # 매우 어두운 경우 (그림자/검은 마이크)
+                            (h > 90 and h < 130 and s > 150 and v < 100) or  # 금속성 파란색/회색
+                            (s < 30 and v < 50)  # 무채색이면서 어두운 경우
+                        )
+                        
+                        if not is_microphone:
+                            # 마이크가 아닌 것으로 판단되면 입 영역은 최소 70% 이상 보존
+                            current_value = adapted_mask[y1+i, x1+j]
+                            min_value = int(original_mask[y1+i, x1+j] * 0.7)  # 70% 보존
+                            smart_mask[y1+i, x1+j] = max(current_value, min_value)
+                        else:
+                            # 마이크로 판단되면 adapted_mask 값 사용 (하지만 완전 제거는 하지 않음)
+                            current_value = adapted_mask[y1+i, x1+j]
+                            min_value = int(original_mask[y1+i, x1+j] * 0.2)  # 최소 20% 보존
+                            smart_mask[y1+i, x1+j] = max(current_value, min_value)
+                            
+                    except (IndexError, ValueError) as e:
+                        # 인덱스 오류 시 원본 값 유지
+                        smart_mask[y1+i, x1+j] = original_mask[y1+i, x1+j]
         
         return smart_mask
+
+    def _create_conservative_mask(self, original_mask: np.ndarray, 
+                                jaw_region: np.ndarray, 
+                                jaw_bbox: Tuple[int, int, int, int]) -> np.ndarray:
+        """
+        색상 보존을 위한 매우 보수적인 마스크 생성
+        오직 명백한 가림만 처리하고 나머지는 원본 유지
+        
+        Args:
+            original_mask: 원본 마스크
+            jaw_region: 턱 영역 이미지  
+            jaw_bbox: 턱 영역 바운딩 박스
+            
+        Returns:
+            np.ndarray: 보수적 마스크
+        """
+        x1, y1, x2, y2 = jaw_bbox
+        conservative_mask = original_mask.copy()
+        
+        try:
+            jaw_mask_region = original_mask[y1:y2, x1:x2]
+            
+            # 크기 검증
+            if jaw_region.shape[:2] != jaw_mask_region.shape[:2]:
+                min_h = min(jaw_region.shape[0], jaw_mask_region.shape[0])
+                min_w = min(jaw_region.shape[1], jaw_mask_region.shape[1])
+                jaw_region = jaw_region[:min_h, :min_w]
+                jaw_mask_region = jaw_mask_region[:min_h, :min_w]
+            
+            # HSV 변환
+            if len(jaw_region.shape) == 3 and jaw_region.shape[2] == 3:
+                hsv_jaw = cv2.cvtColor(jaw_region.astype(np.uint8), cv2.COLOR_BGR2HSV)
+            else:
+                return original_mask
+            
+            # 극도로 보수적인 기준: 명백한 마이크만 처리
+            for i in range(jaw_mask_region.shape[0]):
+                for j in range(jaw_mask_region.shape[1]):
+                    if jaw_mask_region[i, j] > 0:
+                        h, s, v = hsv_jaw[i, j]
+                        
+                        # 극도로 엄격한 마이크 감지 기준
+                        is_obvious_microphone = (
+                            (v < 10) or  # 매우 매우 어두운 경우만
+                            (h > 100 and h < 120 and s > 200 and v < 80)  # 명백한 금속성 파란색만
+                        )
+                        
+                        if is_obvious_microphone:
+                            # 명백한 마이크여도 50% 이상 보존
+                            conservative_mask[y1+i, x1+j] = int(original_mask[y1+i, x1+j] * 0.5)
+                        # else: 원본 값 유지
+                        
+        except Exception as e:
+            print(f"보수적 마스크 생성 중 오류: {e} - 원본 마스크 반환")
+            return original_mask
+            
+        return conservative_mask
 
     def visualize_occlusion_detection(self, original_image: np.ndarray,
                                     original_mask: np.ndarray,

@@ -240,7 +240,10 @@ def main(args):
                 
                 # Merge results with version-specific parameters
                 if args.version == "v15":
-                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], 
+                                            mode=args.parsing_mode, fp=fp,
+                                            enable_occlusion_detection=args.enable_occlusion_detection,
+                                            occlusion_sensitivity=args.occlusion_sensitivity)
                 else:
                     combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
                 cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
@@ -293,5 +296,7 @@ if __name__ == "__main__":
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
     parser.add_argument("--enhance_motion_consistency", action="store_true", help="Enable enhanced motion consistency for moving videos")
     parser.add_argument("--temporal_smoothing", action="store_true", help="Apply temporal smoothing for better lip sync in moving videos")
+    parser.add_argument("--enable_occlusion_detection", action="store_true", help="Enable occlusion detection for face blending")
+    parser.add_argument("--occlusion_sensitivity", type=float, default=0.5, help="Sensitivity for occlusion detection (0.0 to 1.0)")
     args = parser.parse_args()
     main(args)

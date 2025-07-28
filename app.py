@@ -251,7 +251,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     args_dict = {
         "result_dir": './results/output', 
         "fps": 50, 
-        "batch_size": 8, 
+        "batch_size": 4, 
         "output_vid_name": '', 
         "use_saved_coord": False,
         "audio_padding_length_left": 0,
