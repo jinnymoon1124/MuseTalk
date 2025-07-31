@@ -213,6 +213,7 @@ def fast_check_ffmpeg():
 def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
               left_cheek_width=90, right_cheek_width=90, 
               enable_occlusion_detection=True, occlusion_sensitivity=0.3,
+              use_multi_gpu=True, num_gpus=None, segment_duration=30,
               progress=gr.Progress(track_tqdm=True)):
     """
     메인 추론 함수 - 오디오와 비디오를 입력받아 말하는 얼굴을 생성
@@ -222,9 +223,14 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     2. 입력 비디오에서 프레임 추출
     3. 오디오에서 특징 추출
     4. 입력 이미지 전처리 (랜드마크 및 바운딩박스 추출)
-    5. 배치 단위로 추론 실행
+    5. 배치 단위로 추론 실행 (멀티 GPU 지원)
     6. 생성된 이미지를 원본 비디오에 합성
     7. 최종 비디오 생성 및 오디오 합성
+    
+    Args:
+        use_multi_gpu: 멀티 GPU 병렬 처리 사용 여부
+        num_gpus: 사용할 GPU 개수 (None이면 자동 감지)
+        segment_duration: 각 세그먼트 길이 (초, 기본값 30초)
     """
     
     # ===== 1단계: 파라미터 설정 및 초기화 =====
@@ -356,48 +362,197 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     coord_list_cycle = coord_list + coord_list[::-1]
     input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
     
-    # ===== 6단계: 배치 단위로 추론 실행 =====
+    # ===== 6단계: 배치 단위로 추론 실행 (멀티 GPU 지원) =====
     print("start inference")
-    video_num = len(whisper_chunks)
-    batch_size = args.batch_size
     
-    # 데이터 생성기 초기화
-    # 이 생성기는 음성 특징과 이미지 특징을 함께 제공하여 AI 모델이 처리할 수 있도록 합니다
-    gen = datagen(
-        whisper_chunks=whisper_chunks,        # 각 프레임에 해당하는 음성 특징들
-        vae_encode_latents=input_latent_list_cycle,  # 이미지를 숫자로 변환한 특징들
-        batch_size=batch_size,                # 한 번에 처리할 프레임 수 (메모리 효율성을 위해)
-        delay_frame=0,                        # 지연 프레임 (현재는 사용하지 않음)
-        device=device,                        # GPU 또는 CPU 사용 여부
-    )
-    res_frame_list = []
+    # 멀티 GPU 파라미터 디버깅
+    print(f"🔍 [DEBUG] 멀티 GPU 파라미터 확인:")
+    print(f"   - use_multi_gpu: {use_multi_gpu}")
+    print(f"   - num_gpus: {num_gpus}")
+    print(f"   - segment_duration: {segment_duration}")
+    print(f"   - torch.cuda.device_count(): {torch.cuda.device_count()}")
+    print(f"   - use_multi_gpu and torch.cuda.device_count() > 1: {use_multi_gpu and torch.cuda.device_count() > 1}")
     
-    # 배치 단위로 추론 실행
-    # 이 부분이 실제 립싱크를 생성하는 핵심입니다!
-    for i, (whisper_batch,latent_batch) in enumerate(tqdm(gen,total=int(np.ceil(float(video_num)/batch_size)))):
-        # 1. 오디오 특징을 위치 인코딩
-        # - 음성의 시간적 정보를 AI 모델이 이해할 수 있도록 변환
-        # - "이 시간에 이런 소리가 나고 있다"는 정보를 제공
-        audio_feature_batch = pe(whisper_batch)
+    if use_multi_gpu and torch.cuda.device_count() > 1:
+        # 멀티 GPU 병렬 처리
+        print(f"\n🚀 ============ 멀티 GPU 병렬 처리 시작 ============")
+        print(f"   시스템 정보:")
+        print(f"   - 사용 가능한 GPU: {torch.cuda.device_count()}개")
+        print(f"   - 실제 사용할 GPU: {num_gpus if num_gpus else torch.cuda.device_count()}개")
+        print(f"   - 세그먼트 길이: {segment_duration}초")
+        print(f"   - 오디오 파일: {os.path.basename(audio_path)}")
+        print(f"   - 비디오 파일: {os.path.basename(video_path)}")
+        print(f"=================================================\n")
         
-        # 2. 잠재 벡터를 모델 가중치 타입과 일치하도록 변환
-        # - 이미지 특징을 AI 모델이 처리할 수 있는 형태로 변환
-        latent_batch = latent_batch.to(dtype=weight_dtype)
+        from musetalk.utils.multi_gpu_manager import DynamicMultiGPUManager
         
-        # 3. UNet 모델을 사용하여 새로운 잠재 벡터 생성
-        # - 이것이 실제 립싱크를 만드는 마법의 부분입니다!
-        # - AI 모델이 "이 음성에 맞는 입술 움직임"을 예측합니다
-        # - timesteps는 확산 모델에서 사용하는 시간 단계 (현재는 0으로 고정)
-        pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+        # 동적 멀티 GPU 매니저 초기화
+        # Gradio에서 전달된 num_gpus가 float일 수 있으므로 int로 변환
+        num_gpus_int = int(num_gpus) if num_gpus is not None else None
+        segment_duration_int = int(segment_duration) if segment_duration is not None else 30
         
-        # 4. VAE를 사용하여 잠재 벡터를 이미지로 디코딩
-        # - AI가 예측한 "숨겨진 특징"을 실제 이미지로 변환
-        # - 이제 입술이 움직인 새로운 얼굴 이미지가 생성됩니다
-        recon = vae.decode_latents(pred_latents)
+        print(f"🔍 [DEBUG] 변환된 파라미터:")
+        print(f"   - num_gpus_int: {num_gpus_int}")
+        print(f"   - segment_duration_int: {segment_duration_int}")
         
-        # 5. 생성된 이미지들을 결과 리스트에 추가
-        for res_frame in recon:
-            res_frame_list.append(res_frame)
+        multi_gpu_manager = DynamicMultiGPUManager(
+            num_gpus=num_gpus_int,
+            segment_duration=segment_duration_int
+        )
+        
+        # 모델 경로 설정
+        model_paths = {
+            'unet_model_path': "./models/musetalkV15/unet.pth",
+            'vae_type': "sd-vae",
+            'unet_config': "./models/musetalkV15/musetalk.json",
+            'whisper_path': "openai/whisper-tiny"  # 기존과 동일한 경로 사용
+        }
+        
+        # GPU 워커 초기화
+        # 메인 프로세스가 사용 중인 GPU ID 추출 (cuda:1 -> 1)
+        main_gpu_id = int(str(device).split(':')[1]) if ':' in str(device) else 0
+        print(f"🔍 [DEBUG] 메인 프로세스 GPU ID: {main_gpu_id}")
+        
+        multi_gpu_manager.initialize_workers(model_paths, use_float16=True, main_gpu_id=main_gpu_id)
+        
+        # 모델 설정 준비 (강사 강의 영상 처리를 위한 실제 fps 사용)
+        print(f"🔍 [DEBUG] FPS 설정 확인:")
+        print(f"   - 실제 비디오 fps: {fps}")
+        print(f"   - args.fps (기본값): {args.fps}")
+        
+        model_config = {
+            'fps': fps,  # 실제 비디오 fps 사용 (args.fps 대신)
+            'batch_size': args.batch_size,
+            'audio_padding_length_left': args.audio_padding_length_left,
+            'audio_padding_length_right': args.audio_padding_length_right,
+            'extra_margin': args.extra_margin,
+            'coord_list': coord_list_cycle
+        }
+        
+        multi_gpu_success = False
+        try:
+            # 멀티 GPU로 완전 동적 처리
+            # 사용자 요구사항에 따라 완전한 동적 작업 분배 방식 사용
+            res_frame_list = multi_gpu_manager.process_with_full_dynamic_queue(
+                audio_path=audio_path,
+                video_frames=frame_list_cycle,
+                coord_list=coord_list_cycle,
+                model_config=model_config
+            )
+            
+            # 멀티 GPU 처리 성공 여부 확인
+            if len(res_frame_list) > 0:
+                multi_gpu_success = True
+                print(f"\n🎉 ========== 멀티 GPU 처리 성공 ==========")
+                print(f"   - 생성된 프레임: {len(res_frame_list)}개")
+                print(f"   - 사용된 fps: {fps}")
+                print(f"   - 예상 영상 길이: {len(res_frame_list)/fps:.2f}초")
+                print(f"   - 처리 방식: 멀티 GPU 병렬 처리")
+                print(f"   - 사용된 GPU: {num_gpus if num_gpus else torch.cuda.device_count()}개")
+                print(f"==========================================\n")
+            else:
+                print(f"\n⚠️ ========== 멀티 GPU 처리 실패 ==========")
+                print(f"   - 생성된 프레임: 0개")
+                print(f"   - 단일 GPU 폴백 모드로 전환")
+                print(f"==========================================\n")
+            
+        except Exception as e:
+            print(f"\n💥 ========== 멀티 GPU 처리 오류 ==========")
+            print(f"   - 오류: {e}")
+            print(f"   - 단일 GPU 폴백 모드로 전환")
+            print(f"==========================================\n")
+            
+        finally:
+            # 멀티 GPU 매니저 종료
+            print(f"🔄 [MultiGPU] 워커 프로세스 정리 중...")
+            multi_gpu_manager.shutdown()
+            print(f"✅ [MultiGPU] 모든 워커 프로세스 정리 완료")
+            
+        # 멀티 GPU 처리가 실패한 경우 단일 GPU로 폴백
+        if not multi_gpu_success:
+            print(f"\n💻 ============ 단일 GPU 폴백 처리 시작 ============")
+            print(f"   - 멀티 GPU 실패로 인한 폴백 모드")
+            print(f"   - 원본 프레임 사용 (순환 리스트 없음)")
+            print(f"   - 사용 디바이스: {device}")
+            print(f"================================================\n")
+            
+            # 순환 리스트 대신 원본 리스트 사용
+            video_num = len(whisper_chunks)
+            batch_size = args.batch_size
+            
+            # 데이터 생성기 초기화 (순환 리스트 없이)
+            gen = datagen(
+                whisper_chunks=whisper_chunks,
+                vae_encode_latents=input_latent_list,  # 순환 리스트 대신 원본 사용
+                batch_size=batch_size,
+                delay_frame=0,
+                device=device,
+            )
+            res_frame_list = []
+            
+            # 배치 단위로 추론 실행
+            for i, (whisper_batch,latent_batch) in enumerate(tqdm(gen,total=int(np.ceil(float(video_num)/batch_size)))):
+                audio_feature_batch = pe(whisper_batch)
+                latent_batch = latent_batch.to(dtype=weight_dtype)
+                pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+                recon = vae.decode_latents(pred_latents)
+                for res_frame in recon:
+                    res_frame_list.append(res_frame)
+                    
+            print(f"✅ [SingleGPU] 단일 GPU 폴백 처리 완료: {len(res_frame_list)}개 프레임 생성")
+            
+    else:
+        # 단일 GPU 처리 (기존 방식)
+        print(f"\n💻 ============ 단일 GPU 처리 시작 ============")
+        if torch.cuda.device_count() <= 1:
+            print(f"   - 사용 가능한 GPU: {torch.cuda.device_count()}개 (멀티 GPU 불가)")
+        else:
+            print(f"   - 멀티 GPU 옵션이 비활성화됨")
+        print(f"   - 사용 디바이스: {device}")
+        print(f"   - 오디오 파일: {os.path.basename(audio_path)}")
+        print(f"   - 비디오 파일: {os.path.basename(video_path)}")
+        print(f"=============================================\n")
+        
+        video_num = len(whisper_chunks)
+        batch_size = args.batch_size
+        
+        # 데이터 생성기 초기화
+        # 이 생성기는 음성 특징과 이미지 특징을 함께 제공하여 AI 모델이 처리할 수 있도록 합니다
+        gen = datagen(
+            whisper_chunks=whisper_chunks,        # 각 프레임에 해당하는 음성 특징들
+            vae_encode_latents=input_latent_list,  # 원본 이미지 특징 (순환 리스트 없음)
+            batch_size=batch_size,                # 한 번에 처리할 프레임 수 (메모리 효율성을 위해)
+            delay_frame=0,                        # 지연 프레임 (현재는 사용하지 않음)
+            device=device,                        # GPU 또는 CPU 사용 여부
+        )
+        res_frame_list = []
+        
+        # 배치 단위로 추론 실행
+        # 이 부분이 실제 립싱크를 생성하는 핵심입니다!
+        for i, (whisper_batch,latent_batch) in enumerate(tqdm(gen,total=int(np.ceil(float(video_num)/batch_size)))):
+            # 1. 오디오 특징을 위치 인코딩
+            # - 음성의 시간적 정보를 AI 모델이 이해할 수 있도록 변환
+            # - "이 시간에 이런 소리가 나고 있다"는 정보를 제공
+            audio_feature_batch = pe(whisper_batch)
+            
+            # 2. 잠재 벡터를 모델 가중치 타입과 일치하도록 변환
+            # - 이미지 특징을 AI 모델이 처리할 수 있는 형태로 변환
+            latent_batch = latent_batch.to(dtype=weight_dtype)
+            
+            # 3. UNet 모델을 사용하여 새로운 잠재 벡터 생성
+            # - 이것이 실제 립싱크를 만드는 마법의 부분입니다!
+            # - AI 모델이 "이 음성에 맞는 입술 움직임"을 예측합니다
+            # - timesteps는 확산 모델에서 사용하는 시간 단계 (현재는 0으로 고정)
+            pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
+            
+            # 4. VAE를 사용하여 잠재 벡터를 이미지로 디코딩
+            # - AI가 예측한 "숨겨진 특징"을 실제 이미지로 변환
+            # - 이제 입술이 움직인 새로운 얼굴 이미지가 생성됩니다
+            recon = vae.decode_latents(pred_latents)
+            
+            # 5. 생성된 이미지들을 결과 리스트에 추가
+            for res_frame in recon:
+                res_frame_list.append(res_frame)
             
     # ===== 7단계: 생성된 이미지를 원본 비디오에 합성 =====
     print("pad talking image to original video")
@@ -409,9 +564,14 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     for i, res_frame in enumerate(tqdm(res_frame_list)):
         # 1. 현재 프레임에 해당하는 얼굴 위치 정보 가져오기
         # - 원본 비디오에서 얼굴이 어디에 있는지 알려주는 좌표
-        bbox = coord_list_cycle[i%(len(coord_list_cycle))]
-        # - 원본 비디오의 현재 프레임 (배경, 머리카락, 옷 등이 포함된 전체 이미지)
-        ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
+        # 순환 리스트 사용 여부 확인 (멀티 GPU 성공 시에만 순환 리스트 사용)
+        if 'multi_gpu_success' in locals() and multi_gpu_success:
+            bbox = coord_list_cycle[i%(len(coord_list_cycle))]
+            ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
+        else:
+            # 단일 GPU 또는 폴백 모드에서는 원본 리스트 사용
+            bbox = coord_list[i%(len(coord_list))]
+            ori_frame = copy.deepcopy(frame_list[i%(len(frame_list))])
         
         # 2. 얼굴 영역의 좌표 추출
         x1, y1, x2, y2 = bbox  # x1,y1: 왼쪽 위, x2,y2: 오른쪽 아래
@@ -465,8 +625,14 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
         
     # ===== 8단계: 최종 비디오 생성 =====
-    # 프레임 레이트 설정 (초당 50장의 이미지)
-    fps = 50
+    # 🔍 [DEBUG] 최종 비디오 생성 단계 fps 확인
+    print(f"\n🔍 [DEBUG] 최종 비디오 생성 단계:")
+    print(f"   - 현재 fps 값: {fps}")
+    print(f"   - 생성된 프레임 수: {len(res_frame_list) if multi_gpu_success else '단일 GPU 모드'}")
+    
+    # ⚠️ 중요: fps 값을 덮어쓰지 않고 실제 비디오 fps 유지 (강사 강의 영상 처리)
+    # fps = 50  # ← 이 줄을 제거하여 실제 fps 유지
+    
     # 임시 출력 비디오 경로
     output_video = 'temp.mp4'
 
@@ -486,7 +652,13 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     for file in files:
         filename = os.path.join(result_img_save_path, file)
         images.append(imageio.imread(filename))
-        
+    
+    # 🔍 [DEBUG] 이미지 → 비디오 변환 정보
+    print(f"🔍 [DEBUG] 이미지 → 비디오 변환:")
+    print(f"   - 읽어온 이미지 수: {len(images)}개")
+    print(f"   - 사용할 fps: {fps}")
+    print(f"   - 예상 비디오 길이: {len(images)/fps:.2f}초")
+    print(f"   - 출력 파일: {output_video}")
 
     # 이미지들을 비디오로 저장
     # - 여러 장의 이미지를 순서대로 재생하여 비디오로 만듭니다
@@ -503,24 +675,36 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     
     # 비디오 정보 읽기
     reader = imageio.get_reader(input_video)
-    fps = reader.get_meta_data()['fps']  # 원본 비디오의 프레임 레이트 가져오기
+    temp_video_fps = reader.get_meta_data()['fps']  # temp.mp4의 프레임 레이트
     reader.close() # 윈도우에서 파일 사용 중 오류를 방지하기 위해 즉시 닫기
+    
+    # 🔍 [DEBUG] 오디오-비디오 합성 단계 fps 확인
+    print(f"\n🔍 [DEBUG] 오디오-비디오 합성 단계:")
+    print(f"   - 원본 비디오 fps: {fps}")
+    print(f"   - temp.mp4 fps: {temp_video_fps}")
+    print(f"   - 최종 저장에 사용할 fps: {fps}")
 
     # 비디오 클립 로드 (moviepy 라이브러리 사용)
     video_clip = VideoFileClip(input_video)
 
     # 오디오 클립 로드 (원본 음성 파일)
     audio_clip = AudioFileClip(audio_path)
+    
+    # 🔍 [DEBUG] 클립 정보 확인
+    print(f"🔍 [DEBUG] 클립 정보:")
+    print(f"   - 비디오 클립 길이: {video_clip.duration:.2f}초")
+    print(f"   - 오디오 클립 길이: {audio_clip.duration:.2f}초")
 
     # 비디오에 오디오 설정
     # - 이제 립싱크가 적용된 비디오에 원본 음성이 합성됩니다
     video_clip = video_clip.set_audio(audio_clip)
 
-    # 최종 비디오 파일로 저장
+    # 최종 비디오 파일로 저장 (강사 강의 영상 처리를 위한 실제 fps 사용)
     # - libx264: 고품질 비디오 코덱
     # - aac: 고품질 오디오 코덱
-    # - fps=50: 초당 50프레임으로 설정
-    video_clip.write_videofile(output_vid_name, codec='libx264', audio_codec='aac',fps=50)
+    # - fps: 실제 비디오 프레임 레이트 사용 (원본과 동일하게 유지)
+    print(f"🔍 [DEBUG] 최종 비디오 저장: {output_vid_name}")
+    video_clip.write_videofile(output_vid_name, codec='libx264', audio_codec='aac', fps=fps)
 
     # 임시 파일 정리
     os.remove("temp.mp4")  # 임시 비디오 파일 삭제
@@ -530,12 +714,55 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
 
 
 
-# 1번쨰 gpu 사용하도록 임시 지정
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-print(f"=============== Using device: {device} ================")
+# 멀티프로세싱 워커 프로세스인지 확인 (multiprocessing 호출 스택 기반)
+import os
+import sys
+import traceback
 
-# 모든 모델 로드 (VAE, UNet, Position Encoder)
+# 🔥 CRITICAL: multiprocessing fork에서 워커 프로세스 감지
+# fork 방식에서는 환경 변수나 다른 방법으로 워커 프로세스 판별
+def is_multiprocessing_worker():
+    """multiprocessing fork 워커 프로세스인지 확인"""
+    try:
+        # fork 방식에서는 환경 변수 기반으로 판별
+        # 워커 프로세스에서 설정된 환경 변수 확인
+        worker_env = os.environ.get('MUSETALK_WORKER_PROCESS') == 'TRUE'
+        worker_gpu = os.environ.get('WORKER_GPU_ID') is not None
+        
+        # 호출 스택도 함께 확인 (보조적)
+        stack = traceback.extract_stack()
+        stack_worker = any('multiprocessing' in frame.filename for frame in stack)
+        
+        return worker_env or worker_gpu or stack_worker
+    except:
+        return False
+
+# 🔥 CRITICAL: spawn 방식에서 환경 변수 기반 GPU 할당
+# 워커 프로세스는 환경 변수가 설정된 상태로 app.py 실행됨
+worker_gpu_id = os.environ.get('WORKER_GPU_ID') or os.environ.get('FORCE_WORKER_GPU')
+is_worker = os.environ.get('MUSETALK_WORKER_PROCESS') == 'TRUE'
+
+print(f"🔍 [DEBUG] 프로세스 타입 체크:")
+print(f"   - PID: {os.getpid()}")
+print(f"   - MUSETALK_WORKER_PROCESS: {os.environ.get('MUSETALK_WORKER_PROCESS')}")
+print(f"   - is_worker: {is_worker}")
+print(f"   - WORKER_GPU_ID: {os.environ.get('WORKER_GPU_ID')}")
+print(f"   - FORCE_WORKER_GPU: {os.environ.get('FORCE_WORKER_GPU')}")
+print(f"   - CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+
+if is_worker and worker_gpu_id:
+    # 워커 프로세스: CUDA_VISIBLE_DEVICES 적용으로 인해 항상 cuda:0 사용
+    print(f"=============== Worker Process Using GPU {worker_gpu_id} ================")
+    print(f"🔥 [Worker] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}로 설정됨")
+    print(f"🔥 [Worker] 워커 프로세스에서는 실제 GPU {worker_gpu_id}이 cuda:0으로 매핑됩니다")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")  # CUDA_VISIBLE_DEVICES로 인해 항상 0
+    print(f"🔥 [Worker] 디바이스 설정: {device} (실제 물리 GPU: {worker_gpu_id})")
+else:
+    # 메인 프로세스: GPU 0 사용
+    print(f"=============== Main Process Using device: cuda:0 ================")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# 모든 모델 로드 (각 프로세스가 올바른 GPU에서 로딩)
 vae, unet, pe = load_all_model(
     unet_model_path="./models/musetalkV15/unet.pth", 
     vae_type="sd-vae",
@@ -608,9 +835,9 @@ def check_video(video):
     reader = imageio.get_reader(video)
     fps = reader.get_meta_data()['fps']  # 원본 비디오에서 fps 가져오기
 
-    # fps를 50으로 변환
+    # fps를 원본 fps로 유지 (강사 강의 영상의 자연스러운 프레임 레이트 보존)
     frames = [im for im in reader]
-    target_fps = 50
+    target_fps = fps  # 원본 fps 사용
     
     L = len(frames)
     L_target = int(L / fps * target_fps)
@@ -624,8 +851,8 @@ def check_video(video):
                 break
         target_frames.append(frames[t_idx])
 
-    # 비디오 저장
-    imageio.mimwrite(output_video, target_frames, 'FFMPEG', fps=50, codec='libx264', quality=9, pixelformat='yuv420p')
+    # 비디오 저장 (원본 fps로 저장하여 자연스러운 재생 속도 유지)
+    imageio.mimwrite(output_video, target_frames, 'FFMPEG', fps=fps, codec='libx264', quality=9, pixelformat='yuv420p')
     return output_video
 
 
@@ -655,6 +882,20 @@ with gr.Blocks(css=css) as demo:
                                                  minimum=0.1, maximum=1.0, value=0.3, step=0.1,
                                                  info="값이 낮을수록 더 민감하게 가림을 감지/값이 높을수록 덜 민감하게 가림을 감지")
             
+            # 멀티 GPU 관련 컨트롤 추가
+            with gr.Group():
+                gr.Markdown("### 완전 동적 멀티 GPU 병렬 처리 설정 (Full Dynamic Multi-GPU Processing)")
+                use_multi_gpu = gr.Checkbox(label="멀티 GPU 병렬 처리 사용 (Enable Multi-GPU Processing)", value=True,
+                                          info="완전 동적 작업 분배: 먼저 끝나는 GPU가 다음 세그먼트를 즉시 처리")
+                num_gpus = gr.Slider(label="사용할 GPU 개수 (Number of GPUs)", 
+                                   minimum=1, maximum=8, value=torch.cuda.device_count(), step=1,
+                                   info="사용할 GPU 개수 (모든 GPU가 동적으로 작업을 분배받음)")
+                segment_duration = gr.Slider(label="세그먼트 길이 (Segment Duration, seconds)", 
+                                           minimum=0, maximum=60, value=5, step=5,
+                                           info="각 세그먼트 길이 (초) - 더 짧을수록 GPU 활용률 향상")
+                gr.Markdown(f"**현재 사용 가능한 GPU: {torch.cuda.device_count()}개**")
+                gr.Markdown("**동작 방식:** 1분 영상 + 30초 세그먼트 + 4개 GPU = 세그먼트 1,2,3,4를 병렬 처리 → 3번 GPU 완료 시 5번 세그먼트 즉시 할당 → 최대 효율 달성")
+            
             bbox_shift_scale = gr.Textbox(label="'left_cheek_width'와 'right_cheek_width' 파라미터는 파싱 모델이 'jaw'일 때 좌우 볼 편집 범위를 결정합니다. 'extra_margin' 파라미터는 턱의 움직임 범위를 결정합니다. 사용자는 이 세 파라미터를 자유롭게 조정하여 더 나은 인페인팅 결과를 얻을 수 있습니다. 가림 감지 기능은 마이크 등의 물체에 의해 얼굴이 가려진 부분에서 자연스러운 립싱크를 제공합니다.")
 
             with gr.Row():
@@ -681,7 +922,10 @@ with gr.Blocks(css=css) as demo:
             left_cheek_width,
             right_cheek_width,
             enable_occlusion_detection,
-            occlusion_sensitivity
+            occlusion_sensitivity,
+            use_multi_gpu,
+            num_gpus,
+            segment_duration
         ],
         outputs=[out1,bbox_shift_scale]
     )
@@ -727,9 +971,11 @@ with gr.Blocks(css=css) as demo:
 #     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # ===== Gradio 애플리케이션 시작 =====
-demo.queue().launch(
-    share=args.share, 
-    debug=True, 
-    server_name="10.202.15.248",
-    server_port=8000
-)
+# 워커 프로세스에서 실행되지 않도록 보호
+if __name__ == "__main__":
+    demo.queue().launch(
+        share=args.share, 
+        debug=True, 
+        server_name="10.202.15.248",
+        server_port=8000
+    )

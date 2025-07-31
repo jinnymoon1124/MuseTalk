@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from einops import rearrange
 from transformers import AutoFeatureExtractor
+from typing import List, Dict
 
 
 class AudioProcessor:
@@ -18,7 +19,7 @@ class AudioProcessor:
     3. 비디오 프레임과 동기화할 수 있도록 시간별로 분할
     """
     
-    def __init__(self, feature_extractor_path="openai/whisper-tiny/"):
+    def __init__(self, feature_extractor_path="openai/whisper-tiny"):
         """
         오디오 프로세서 초기화
         
@@ -78,6 +79,201 @@ class AudioProcessor:
             features.append(audio_feature)
 
         return features, len(librosa_output)
+
+    def split_audio_for_multi_gpu(self, wav_path: str, segment_duration: int = 30, 
+                                 num_gpus: int = 1) -> List[Dict]:
+        """
+        멀티 GPU 병렬 처리를 위해 오디오를 세그먼트로 분할
+        
+        강사 강의 영상의 특성을 고려하여 설계:
+        - 움직이는 강사
+        - 고개를 많이 돌리는 동작
+        - 핸드마이크로 인한 얼굴 가림
+        
+        Args:
+            wav_path: 음성 파일 경로
+            segment_duration: 각 세그먼트 길이 (초, 기본값 30초)
+            num_gpus: 사용할 GPU 개수
+            
+        Returns:
+            List[Dict]: 각 세그먼트 정보
+            [
+                {
+                    'segment_id': 0,
+                    'start_time': 0.0,
+                    'end_time': 30.0,
+                    'start_sample': 0,
+                    'end_sample': 480000,
+                    'audio_data': numpy_array,
+                    'gpu_id': 0
+                },
+                ...
+            ]
+        """
+        # 파일 존재 여부 확인
+        if not os.path.exists(wav_path):
+            raise FileNotFoundError(f"Audio file not found: {wav_path}")
+            
+        print(f"🎵 [AudioProcessor] 오디오 파일 로딩 시작: {wav_path}")
+        
+        # 음성 파일 로드 (16kHz로 표준화)
+        librosa_output, sampling_rate = librosa.load(wav_path, sr=16000)
+        assert sampling_rate == 16000, "샘플링 레이트가 16kHz가 아닙니다"
+        
+        # 전체 오디오 길이 계산
+        total_duration = len(librosa_output) / sampling_rate
+        segment_length_samples = segment_duration * sampling_rate  # 30초 = 480,000 샘플
+        
+        print(f"📊 [AudioProcessor] 오디오 정보:")
+        print(f"   - 전체 길이: {total_duration:.2f}초 ({len(librosa_output):,} 샘플)")
+        print(f"   - 세그먼트 길이: {segment_duration}초 ({segment_length_samples:,} 샘플)")
+        print(f"   - 예상 세그먼트 수: {int(np.ceil(total_duration / segment_duration))}개")
+        
+        segments = []
+        segment_id = 0
+        gpu_assignment = 0  # GPU 할당을 위한 카운터
+        
+        # 세그먼트별로 분할
+        for start_sample in range(0, len(librosa_output), segment_length_samples):
+            end_sample = min(start_sample + segment_length_samples, len(librosa_output))
+            start_time = start_sample / sampling_rate
+            end_time = end_sample / sampling_rate
+            
+            # 세그먼트 데이터 추출
+            segment_data = librosa_output[start_sample:end_sample]
+            
+            # 세그먼트 정보 생성
+            segment_info = {
+                'segment_id': segment_id,
+                'start_time': start_time,
+                'end_time': end_time,
+                'start_sample': start_sample,
+                'end_sample': end_sample,
+                'audio_data': segment_data,
+                'gpu_id': gpu_assignment % num_gpus,  # 라운드 로빈 방식으로 GPU 할당
+                'duration': end_time - start_time
+            }
+            
+            segments.append(segment_info)
+            segment_id += 1
+            gpu_assignment += 1
+            
+            # 세그먼트별 상세 정보 출력 (처음 5개와 마지막 5개만)
+            if segment_id <= 5 or segment_id > len(segments) - 5:
+                print(f"   📦 세그먼트 {segment_id-1}: {start_time:.1f}-{end_time:.1f}초 → GPU {gpu_assignment-1}")
+            elif segment_id == 6:
+                print(f"   📦 ... (중간 세그먼트 생략)")
+            
+        print(f"✅ [AudioProcessor] 오디오 분할 완료:")
+        print(f"   - 총 {len(segments)}개 세그먼트 생성 (총 {total_duration:.2f}초)")
+        print(f"   - {num_gpus}개 GPU에 라운드 로빈 방식으로 분산 배치")
+        
+        # GPU별 할당된 세그먼트 수 계산
+        gpu_counts = {}
+        for segment in segments:
+            gpu_id = segment['gpu_id']
+            gpu_counts[gpu_id] = gpu_counts.get(gpu_id, 0) + 1
+        
+        print(f"   - GPU별 할당 현황:")
+        for gpu_id in sorted(gpu_counts.keys()):
+            print(f"     GPU {gpu_id}: {gpu_counts[gpu_id]}개 세그먼트")
+        
+        return segments
+
+    def create_dynamic_segments(self, wav_path: str, segment_duration: int = 30) -> List[Dict]:
+        """
+        완전 동적 작업 분배를 위한 세그먼트 생성
+        
+        GPU 할당 없이 세그먼트만 생성하여 동적 큐에서 처리할 수 있도록 함
+        강사 강의 영상의 특성을 고려:
+        - 움직이는 강사와 고개 움직임
+        - 핸드마이크로 인한 얼굴 가림 등
+        
+        Args:
+            wav_path: 음성 파일 경로
+            segment_duration: 각 세그먼트 길이 (초, 기본값 30초)
+            
+        Returns:
+            List[Dict]: GPU 할당 없는 순수한 세그먼트 정보 리스트
+        """
+        # 파일 존재 여부 확인
+        if not os.path.exists(wav_path):
+            raise FileNotFoundError(f"Audio file not found: {wav_path}")
+            
+        print(f"🎵 [AudioProcessor] 동적 세그먼트 생성 시작: {wav_path}")
+        
+        # 오디오 파일 로딩 (16kHz로 리샘플링)
+        librosa_output, sampling_rate = librosa.load(wav_path, sr=16000)
+        total_duration = len(librosa_output) / sampling_rate
+        segment_length_samples = segment_duration * sampling_rate
+        
+        print(f"   - 오디오 길이: {total_duration:.2f}초")
+        print(f"   - 샘플링 레이트: {sampling_rate}Hz")
+        print(f"   - 세그먼트 길이: {segment_duration}초")
+        
+        segments = []
+        segment_id = 0
+        
+        # 세그먼트별로 분할 (GPU 할당 없이)
+        for start_sample in range(0, len(librosa_output), segment_length_samples):
+            end_sample = min(start_sample + segment_length_samples, len(librosa_output))
+            start_time = start_sample / sampling_rate
+            end_time = end_sample / sampling_rate
+            
+            # 세그먼트 데이터 추출
+            segment_data = librosa_output[start_sample:end_sample]
+            
+            # 세그먼트 정보 생성 (GPU 할당 없음)
+            segment_info = {
+                'segment_id': segment_id,
+                'start_time': start_time,
+                'end_time': end_time,
+                'duration': end_time - start_time,
+                'start_sample': start_sample,
+                'end_sample': end_sample,
+                'audio_data': segment_data,
+                'sample_rate': sampling_rate
+            }
+            
+            segments.append(segment_info)
+            segment_id += 1
+            
+            # 세그먼트 정보 출력 (처음 5개와 마지막 5개만)
+            if segment_id <= 5 or segment_id > len(segments) - 5:
+                print(f"   📦 세그먼트 {segment_id-1}: {start_time:.1f}-{end_time:.1f}초 ({end_time-start_time:.1f}초)")
+            elif segment_id == 6:
+                print(f"   📦 ... (중간 세그먼트 생략)")
+            
+        print(f"✅ [AudioProcessor] 동적 세그먼트 생성 완료:")
+        print(f"   - 총 {len(segments)}개 세그먼트 생성 (총 {total_duration:.2f}초)")
+        print(f"   - GPU 할당 없음 (동적 큐에서 처리)")
+        
+        return segments
+
+    def get_audio_feature_from_segment(self, segment_data: np.ndarray, 
+                                     weight_dtype=None) -> torch.Tensor:
+        """
+        세그먼트 데이터에서 오디오 특징 추출
+        
+        Args:
+            segment_data: 오디오 세그먼트 데이터
+            weight_dtype: 데이터 타입
+            
+        Returns:
+            torch.Tensor: 추출된 오디오 특징
+        """
+        # Whisper 특징 추출기를 사용하여 음성을 AI가 이해할 수 있는 형태로 변환
+        audio_feature = self.feature_extractor(
+            segment_data,
+            return_tensors="pt",  # PyTorch 텐서 형태로 반환
+            sampling_rate=16000
+        ).input_features
+        
+        # 데이터 타입 변환이 필요한 경우 적용
+        if weight_dtype is not None:
+            audio_feature = audio_feature.to(dtype=weight_dtype)
+            
+        return audio_feature
 
     def get_whisper_chunk(
         self,

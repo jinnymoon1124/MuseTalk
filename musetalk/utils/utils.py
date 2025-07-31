@@ -18,10 +18,49 @@ def load_all_model(
     unet_config=os.path.join("models", "musetalkV15", "musetalk.json"),
     device=None,
 ):
-    # 👉 모델 로딩 함수
+    # 👉 모델 로딩 함수 (멀티 GPU 지원 개선)
     # VAE: 이미지를 잠재공간으로 인코딩하거나 디코딩하는 역할
     # UNet: 얼굴의 입 모양을 예측하는 네트워크
     # PositionalEncoding: 시계열 정보(프레임 순서)를 추가해주는 역할
+    
+    # 워커 프로세스인지 확인하여 올바른 디바이스 사용 (다중 환경변수 체크)
+    import os
+    worker_gpu_id = os.environ.get('WORKER_GPU_ID') or os.environ.get('FORCE_WORKER_GPU')
+    
+    print(f"🔍 [load_all_model] 환경 변수 체크:")
+    print(f"   - WORKER_GPU_ID: {os.environ.get('WORKER_GPU_ID')}")
+    print(f"   - FORCE_WORKER_GPU: {os.environ.get('FORCE_WORKER_GPU')}")
+    print(f"   - 입력 device: {device}")
+    
+    # 워커 프로세스 여부 확인
+    is_worker = os.environ.get('MUSETALK_WORKER_PROCESS') == 'TRUE'
+    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    
+    if is_worker and worker_gpu_id is not None:
+        # 워커 프로세스: CUDA_VISIBLE_DEVICES로 인해 항상 cuda:0 사용
+        worker_device = torch.device("cuda:0")  # CUDA_VISIBLE_DEVICES로 매핑됨
+        print(f"🔥 [load_all_model] 워커 프로세스 디바이스: {worker_device} (실제 물리 GPU: {worker_gpu_id})")
+        print(f"🔥 [load_all_model] CUDA_VISIBLE_DEVICES={cuda_visible}로 매핑됨")
+        device = worker_device
+    elif device is None:
+        # 디바이스가 지정되지 않은 경우 기본값 설정
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        print(f"🔧 [load_all_model] 기본 디바이스 사용: {device}")
+    else:
+        print(f"🔧 [load_all_model] 지정된 디바이스 사용: {device}")
+    
+    # 명시적으로 현재 CUDA 디바이스 설정 (강제)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+        # 현재 디바이스 확인
+        current_device = torch.cuda.current_device()
+        if current_device != device.index:
+            print(f"⚠️ [load_all_model] 디바이스 불일치! 요청: {device}, 현재: cuda:{current_device}")
+            # 다시 강제 설정
+            torch.cuda.set_device(device.index)
+            current_device = torch.cuda.current_device()
+        print(f"🔧 [load_all_model] CUDA 디바이스 설정 완료: cuda:{current_device}")
+    
     vae = VAE(
         model_path = os.path.join("models", vae_type),
     )
