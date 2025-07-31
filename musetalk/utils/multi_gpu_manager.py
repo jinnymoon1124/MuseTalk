@@ -220,6 +220,48 @@ class DynamicMultiGPUManager:
         print(f"   - 사용할 GPU: {self.num_gpus}개")
         print(f"   - 세그먼트 길이: {self.segment_duration}초")
         print(f"   - 작업 분배 방식: 동적 큐 기반")
+    
+    def _interpolate_coordinate(self, target_idx: int, valid_indices: List[int], coord_list: List) -> tuple:
+        """
+        좌표 보간 함수 - 강사 움직임으로 인한 좌표 누락 시 사용
+        
+        Args:
+            target_idx: 보간할 프레임 인덱스
+            valid_indices: 유효한 좌표가 있는 인덱스 리스트
+            coord_list: 전체 좌표 리스트
+            
+        Returns:
+            tuple: 보간된 좌표 (x1, y1, x2, y2)
+        """
+        if not valid_indices:
+            # 유효한 좌표가 없는 경우 기본값 반환
+            return None
+        
+        # 가장 가까운 유효한 좌표 찾기
+        closest_idx = min(valid_indices, key=lambda x: abs(x - target_idx))
+        
+        # 선형 보간을 위해 앞뒤 좌표 찾기
+        before_indices = [idx for idx in valid_indices if idx < target_idx]
+        after_indices = [idx for idx in valid_indices if idx > target_idx]
+        
+        if before_indices and after_indices:
+            # 앞뒤 좌표가 모두 있는 경우 선형 보간
+            before_idx = max(before_indices)
+            after_idx = min(after_indices)
+            
+            before_coord = coord_list[before_idx]
+            after_coord = coord_list[after_idx]
+            
+            # 선형 보간 계산
+            weight = (target_idx - before_idx) / (after_idx - before_idx)
+            interpolated = []
+            for i in range(4):  # x1, y1, x2, y2
+                interpolated.append(int(before_coord[i] + weight * (after_coord[i] - before_coord[i])))
+            
+            return tuple(interpolated)
+        else:
+            # 한쪽만 있는 경우 가장 가까운 좌표 사용
+            return coord_list[closest_idx]
         
     def initialize_workers(self, model_paths: Dict[str, str], use_float16: bool = True, main_gpu_id: int = None):
         """
@@ -338,19 +380,61 @@ class DynamicMultiGPUManager:
         for segment in segments:
             gpu_id = segment['gpu_id']
             
-            # 해당 세그먼트에 대응하는 비디오 프레임 계산
+            # 해당 세그먼트에 대응하는 비디오 프레임 계산 (강사 강의 영상 정확한 매핑)
             start_frame = int(segment['start_time'] * model_config['fps'])
             end_frame = int(segment['end_time'] * model_config['fps'])
             
-            # 순환 리스트에서 프레임 추출
+            # 실제 비디오 길이 기반 프레임 추출 (순환 대신 정확한 시간 매핑)
             segment_frames = []
             segment_coords = []
             total_frames = len(video_frames_serializable)
+            video_duration = total_frames / model_config['fps']  # 실제 비디오 길이 (초)
+            
+            print(f"   🎬 [COORD MAPPING] 세그먼트 {segment['segment_id']}: {segment['start_time']:.1f}-{segment['end_time']:.1f}초")
+            print(f"      - 비디오 길이: {video_duration:.1f}초 ({total_frames}프레임)")
+            print(f"      - 요청 프레임 범위: {start_frame}-{end_frame-1}")
+            
+            # 좌표 보간을 위한 유효한 좌표 인덱스 수집 (강사 움직임 추적 안정성 향상)
+            valid_coord_indices = []
+            for idx in range(min(total_frames, end_frame)):
+                if idx < len(coord_list) and coord_list[idx] is not None:
+                    valid_coord_indices.append(idx)
             
             for frame_idx in range(start_frame, end_frame):
-                cycle_idx = frame_idx % total_frames
-                segment_frames.append(video_frames_serializable[cycle_idx])
-                segment_coords.append(coord_list[cycle_idx])
+                if frame_idx < total_frames:
+                    # 실제 프레임이 존재하는 경우 - 정확한 좌표 사용
+                    segment_frames.append(video_frames_serializable[frame_idx])
+                    
+                    # 좌표 처리: 유효하지 않은 경우 보간 사용
+                    if frame_idx < len(coord_list) and coord_list[frame_idx] is not None:
+                        segment_coords.append(coord_list[frame_idx])
+                    else:
+                        # 좌표 보간: 가장 가까운 유효한 좌표 사용 (강사 얼굴 추적 연속성 보장)
+                        interpolated_coord = self._interpolate_coordinate(frame_idx, valid_coord_indices, coord_list)
+                        segment_coords.append(interpolated_coord)
+                        
+                        if frame_idx - start_frame < 3:  # 처음 몇 개만 로그 출력
+                            print(f"      🔄 프레임 {frame_idx}: 좌표 보간 적용")
+                else:
+                    # 비디오 길이를 초과하는 경우 - 마지막 유효한 프레임과 좌표 사용
+                    last_valid_idx = total_frames - 1
+                    segment_frames.append(video_frames_serializable[last_valid_idx])
+                    segment_coords.append(coord_list[last_valid_idx])
+                    
+                    # 처음 몇 번만 경고 출력 (로그 스팸 방지)
+                    if frame_idx - total_frames < 3:
+                        print(f"      ⚠️  프레임 {frame_idx}: 비디오 범위 초과, 마지막 프레임({last_valid_idx}) 재사용")
+            
+            # 좌표 매핑 검증 (강사 강의 영상 품질 보장)
+            valid_coords = [coord for coord in segment_coords if coord is not None]
+            if len(valid_coords) > 0:
+                print(f"      ✅ 유효한 좌표: {len(valid_coords)}/{len(segment_coords)}개")
+                # 첫 번째와 마지막 좌표 샘플 출력
+                first_coord = segment_coords[0][:2] if segment_coords[0] else 'None'
+                last_coord = segment_coords[-1][:2] if segment_coords[-1] else 'None'
+                print(f"      📍 좌표 범위: {first_coord} → {last_coord}")
+            else:
+                print(f"      ❌ 경고: 유효한 좌표가 없음, 기본값 사용 필요")
             
             # 작업 패키지 생성
             # 세그먼트의 실제 길이 정보를 config에 추가 (강사 강의 영상 처리를 위한 정확한 시간 동기화)
@@ -657,19 +741,64 @@ class DynamicMultiGPUManager:
         print(f"📋 [FullDynamic] 모든 세그먼트를 동적 큐에 추가 중...")
         
         for segment in segments:
-            # 해당 세그먼트에 대응하는 비디오 프레임 계산
+            # 해당 세그먼트에 대응하는 비디오 프레임 계산 (강사 강의 영상 정확한 매핑)
             start_frame = int(segment['start_time'] * model_config['fps'])
             end_frame = int(segment['end_time'] * model_config['fps'])
             
-            # 순환 리스트에서 프레임 추출
+            # 실제 비디오 길이 기반 프레임 추출 (순환 대신 정확한 시간 매핑)
             segment_frames = []
             segment_coords = []
             total_frames = len(video_frames_serializable)
+            video_duration = total_frames / model_config['fps']  # 실제 비디오 길이 (초)
+            
+            # 세그먼트별 상세 매핑 정보 출력 (처음 5개와 마지막 5개만)
+            if segment['segment_id'] < 5 or segment['segment_id'] >= len(segments) - 5:
+                print(f"   🎬 [DYNAMIC COORD] 세그먼트 {segment['segment_id']}: {segment['start_time']:.1f}-{segment['end_time']:.1f}초")
+                print(f"      - 비디오 길이: {video_duration:.1f}초 ({total_frames}프레임)")
+                print(f"      - 요청 프레임 범위: {start_frame}-{end_frame-1}")
+            
+            # 좌표 보간을 위한 유효한 좌표 인덱스 수집 (강사 움직임 추적 안정성 향상)
+            valid_coord_indices = []
+            for idx in range(min(total_frames, end_frame)):
+                if idx < len(coord_list) and coord_list[idx] is not None:
+                    valid_coord_indices.append(idx)
             
             for frame_idx in range(start_frame, end_frame):
-                cycle_idx = frame_idx % total_frames
-                segment_frames.append(video_frames_serializable[cycle_idx])
-                segment_coords.append(coord_list[cycle_idx])
+                if frame_idx < total_frames:
+                    # 실제 프레임이 존재하는 경우 - 정확한 좌표 사용
+                    segment_frames.append(video_frames_serializable[frame_idx])
+                    
+                    # 좌표 처리: 유효하지 않은 경우 보간 사용
+                    if frame_idx < len(coord_list) and coord_list[frame_idx] is not None:
+                        segment_coords.append(coord_list[frame_idx])
+                    else:
+                        # 좌표 보간: 가장 가까운 유효한 좌표 사용 (강사 얼굴 추적 연속성 보장)
+                        interpolated_coord = self._interpolate_coordinate(frame_idx, valid_coord_indices, coord_list)
+                        segment_coords.append(interpolated_coord)
+                        
+                        if (frame_idx - start_frame < 3) and (segment['segment_id'] < 5 or segment['segment_id'] >= len(segments) - 5):
+                            print(f"      🔄 프레임 {frame_idx}: 좌표 보간 적용")
+                else:
+                    # 비디오 길이를 초과하는 경우 - 마지막 유효한 프레임과 좌표 사용
+                    last_valid_idx = total_frames - 1
+                    segment_frames.append(video_frames_serializable[last_valid_idx])
+                    segment_coords.append(coord_list[last_valid_idx])
+                    
+                    # 처음 몇 번만 경고 출력 (로그 스팸 방지)
+                    if frame_idx - total_frames < 3 and (segment['segment_id'] < 5 or segment['segment_id'] >= len(segments) - 5):
+                        print(f"      ⚠️  프레임 {frame_idx}: 비디오 범위 초과, 마지막 프레임({last_valid_idx}) 재사용")
+            
+            # 좌표 매핑 검증 (강사 강의 영상 품질 보장) - 상세 로그는 일부만
+            valid_coords = [coord for coord in segment_coords if coord is not None]
+            if segment['segment_id'] < 5 or segment['segment_id'] >= len(segments) - 5:
+                if len(valid_coords) > 0:
+                    print(f"      ✅ 유효한 좌표: {len(valid_coords)}/{len(segment_coords)}개")
+                    # 첫 번째와 마지막 좌표 샘플 출력
+                    first_coord = segment_coords[0][:2] if segment_coords[0] else 'None'
+                    last_coord = segment_coords[-1][:2] if segment_coords[-1] else 'None'
+                    print(f"      📍 좌표 범위: {first_coord} → {last_coord}")
+                else:
+                    print(f"      ❌ 경고: 유효한 좌표가 없음, 기본값 사용 필요")
             
             # 작업 패키지 생성 (GPU 할당 없음)
             # 세그먼트의 실제 길이 정보를 config에 추가 (강사 강의 영상 처리를 위한 정확한 시간 동기화)
@@ -935,8 +1064,11 @@ class GPUWorker:
             
             # 2. 비디오 프레임 처리 (실제 추론 로직)
             print(f"   🔄 [GPU {gpu_id} Worker] 프레임 처리 시작...")
+            
+            # 세그먼트별 좌표 리스트 사용 (강사 강의 영상의 정확한 얼굴 위치 매핑)
+            segment_coords = task.get('coord_list', [])
             processed_frames = self._process_frames(
-                audio_features, video_frames, config
+                audio_features, video_frames, config, segment_coords
             )
             
             print(f"   ✅ [GPU {gpu_id} Worker] 세그먼트 {segment_id} 처리 완료:")
@@ -968,7 +1100,7 @@ class GPUWorker:
             
     def _process_frames(self, audio_features: torch.Tensor, 
                        video_frames: List[np.ndarray], 
-                       config: Dict) -> List[np.ndarray]:
+                       config: Dict, segment_coords: List = None) -> List[np.ndarray]:
         """
         실제 프레임 처리 로직
         
@@ -1023,28 +1155,63 @@ class GPUWorker:
         # 2. 비디오 프레임을 VAE 잠재 공간으로 변환
         print(f"      🖼️  [GPU {gpu_id}] 비디오 프레임 처리 시작...")
         input_latent_list = []
-        coord_list = config.get('coord_list', [])
+        # 세그먼트별 좌표 사용 (강사 강의 영상의 정확한 얼굴 매핑)
+        coord_list = segment_coords if segment_coords is not None else config.get('coord_list', [])
         print(f"         - 입력 프레임 수: {len(video_frames)}")
         print(f"         - 좌표 리스트 길이: {len(coord_list)}")
+        print(f"         - 세그먼트별 좌표 사용: {'Yes' if segment_coords is not None else 'No (전체 좌표 사용)'}")
+        
+        # 좌표 유효성 사전 검증 (강사 강의 영상 안정성 보장)
+        valid_coord_count = 0
+        invalid_coord_indices = []
+        for i, coord in enumerate(coord_list):
+            if coord is not None and len(coord) >= 4:
+                x1, y1, x2, y2 = coord[:4]
+                if x2 > x1 and y2 > y1 and x1 >= 0 and y1 >= 0:
+                    valid_coord_count += 1
+                else:
+                    invalid_coord_indices.append(i)
+            else:
+                invalid_coord_indices.append(i)
+        
+        print(f"         - 유효한 좌표: {valid_coord_count}/{len(coord_list)}개")
+        if len(invalid_coord_indices) > 0:
+            print(f"         - 무효한 좌표 인덱스: {invalid_coord_indices[:5]}{'...' if len(invalid_coord_indices) > 5 else ''}")
         
         for i, frame in enumerate(video_frames):
             if i < len(coord_list):
                 # 좌표가 있는 경우 얼굴 영역 크롭
                 bbox = coord_list[i]
-                if bbox is not None:
-                    x1, y1, x2, y2 = bbox
-                    extra_margin = config.get('extra_margin', 10)
-                    y2 = y2 + extra_margin
-                    y2 = min(y2, frame.shape[0])
+                if bbox is not None and len(bbox) >= 4:
+                    x1, y1, x2, y2 = bbox[:4]
                     
-                    # 얼굴 영역 크롭 및 리사이즈
-                    crop_frame = frame[y1:y2, x1:x2]
-                    crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+                    # 좌표 유효성 재검증 (강사 움직임으로 인한 잘못된 좌표 필터링)
+                    if x2 > x1 and y2 > y1 and x1 >= 0 and y1 >= 0 and x2 <= frame.shape[1] and y2 <= frame.shape[0]:
+                        # 디버깅: 처음 3개와 마지막 3개 프레임의 좌표 정보 출력
+                        if i < 3 or i >= len(video_frames) - 3:
+                            print(f"         - 프레임 {i}: 유효한 좌표 ({x1}, {y1}, {x2}, {y2})")
+                        
+                        extra_margin = config.get('extra_margin', 10)
+                        y2 = y2 + extra_margin
+                        y2 = min(y2, frame.shape[0])
+                        
+                        # 얼굴 영역 크롭 및 리사이즈
+                        crop_frame = frame[y1:y2, x1:x2]
+                        crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+                    else:
+                        # 잘못된 좌표인 경우 전체 프레임 사용
+                        if i < 3 or i >= len(video_frames) - 3:
+                            print(f"         - 프레임 {i}: 잘못된 좌표 ({x1}, {y1}, {x2}, {y2}), 전체 프레임 사용")
+                        crop_frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
                 else:
                     # 좌표가 없는 경우 전체 프레임 사용
+                    if i < 3 or i >= len(video_frames) - 3:
+                        print(f"         - 프레임 {i}: 좌표 없음, 전체 프레임 사용")
                     crop_frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
             else:
                 # 좌표 리스트가 부족한 경우 전체 프레임 사용
+                if i < 3 or i >= len(video_frames) - 3:
+                    print(f"         - 프레임 {i}: 좌표 리스트 부족, 전체 프레임 사용")
                 crop_frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
             
             # VAE를 사용하여 잠재 벡터로 변환
