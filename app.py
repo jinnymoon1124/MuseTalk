@@ -15,6 +15,7 @@ from argparse import Namespace
 import imageio
 from moviepy.editor import *
 from transformers import WhisperModel
+from datetime import datetime
 
 # 사용X
 # import time
@@ -251,6 +252,14 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     }
     args = Namespace(**args_dict)
 
+    # ⏰ [TIME] 전체 처리 시작 시간 기록
+    start_time = datetime.now()
+    print(f"\n⏰ ========== 강사 강의 영상 립싱크 처리 시작 ==========")
+    print(f"   🕐 시작 시간: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   📁 입력 비디오: {os.path.basename(video_path)}")
+    print(f"   🎵 입력 오디오: {os.path.basename(audio_path)}")
+    print(f"=======================================================\n")
+
     # ffmpeg 설치 여부 확인
     if not fast_check_ffmpeg():
         print("Warning: Unable to find ffmpeg, please ensure ffmpeg is properly installed")
@@ -260,13 +269,33 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     audio_basename = os.path.basename(audio_path).split('.')[0]
     output_basename = f"{input_basename}_{audio_basename}"
     
-    # 임시 디렉토리 생성
+    # 임시 디렉토리 생성 및 정리
     temp_dir = os.path.join(args.result_dir, f"{args.version}")
+    
+    # 🔧 [CLEANUP] 시작 시 전체 임시 디렉토리 정리 (강사 강의 영상 처리 시 깨끗한 시작)
+    if os.path.exists(temp_dir):
+        print(f"🧹 [CLEANUP] 시작 시 전체 임시 디렉토리 정리: {temp_dir}")
+        import shutil
+        for item in os.listdir(temp_dir):
+            item_path = os.path.join(temp_dir, item)
+            try:
+                if os.path.isdir(item_path):
+                    print(f"   - 폴더 삭제: {item}")
+                    shutil.rmtree(item_path)
+                else:
+                    print(f"   - 파일 삭제: {item}")
+                    os.remove(item_path)
+            except Exception as e:
+                print(f"   - 삭제 실패 (무시): {item} - {e}")
+        print(f"✅ [CLEANUP] 시작 시 전체 정리 완료")
+    
     os.makedirs(temp_dir, exist_ok=True)
     
     # 결과 저장 경로 설정
     result_img_save_path = os.path.join(temp_dir, output_basename)
     crop_coord_save_path = os.path.join(args.result_dir, "../", input_basename+".pkl")
+    
+    # 결과 저장 폴더 생성 (이미 위에서 전체 정리 완료)
     os.makedirs(result_img_save_path, exist_ok=True)
 
     if args.output_vid_name == "":
@@ -278,6 +307,8 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     if get_file_type(video_path) == "video":
         # 비디오 파일인 경우: 프레임을 추출하여 이미지로 저장
         save_dir_full = os.path.join(temp_dir, input_basename)
+        
+        # 프레임 저장 폴더 생성 (이미 위에서 전체 정리 완료)
         os.makedirs(save_dir_full, exist_ok=True)
         # 비디오 읽기
         reader = imageio.get_reader(video_path)
@@ -329,7 +360,16 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     else:
         # 랜드마크 및 바운딩박스 추출 (시간이 오래 걸림)
         print("extracting landmarks...time consuming")
+        
+        preprocessing_start = datetime.now()
+        print(f"⏰ [TIME] 얼굴 전처리 시작: {preprocessing_start.strftime('%H:%M:%S')}")
+        
         coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
+        
+        preprocessing_end = datetime.now()
+        preprocessing_duration = preprocessing_end - preprocessing_start
+        print(f"⏰ [TIME] 얼굴 전처리 완료: {preprocessing_duration.total_seconds():.1f}초 소요")
+        
         # 추출된 좌표를 파일로 저장 (다음 실행 시 재사용)
         with open(crop_coord_save_path, 'wb') as f:
             pickle.dump(coord_list, f)
@@ -373,9 +413,14 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     print(f"   - torch.cuda.device_count(): {torch.cuda.device_count()}")
     print(f"   - use_multi_gpu and torch.cuda.device_count() > 1: {use_multi_gpu and torch.cuda.device_count() > 1}")
     
+    # 멀티 GPU 성공 여부 플래그 초기화 (단일 GPU 모드에서도 사용)
+    multi_gpu_success = False
+    
     if use_multi_gpu and torch.cuda.device_count() > 1:
         # 멀티 GPU 병렬 처리
+        multigpu_start = datetime.now()
         print(f"\n🚀 ============ 멀티 GPU 병렬 처리 시작 ============")
+        print(f"   ⏰ 시작 시간: {multigpu_start.strftime('%H:%M:%S')}")
         print(f"   시스템 정보:")
         print(f"   - 사용 가능한 GPU: {torch.cuda.device_count()}개")
         print(f"   - 실제 사용할 GPU: {num_gpus if num_gpus else torch.cuda.device_count()}개")
@@ -440,10 +485,16 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
                 model_config=model_config
             )
             
+            # 멀티 GPU 처리 완료 시간 측정
+            multigpu_end = datetime.now()
+            multigpu_duration = multigpu_end - multigpu_start
+            
             # 멀티 GPU 처리 성공 여부 확인
             if len(res_frame_list) > 0:
                 multi_gpu_success = True
                 print(f"\n🎉 ========== 멀티 GPU 처리 성공 ==========")
+                print(f"   ⏰ 완료 시간: {multigpu_end.strftime('%H:%M:%S')}")
+                print(f"   ⏱️  소요 시간: {multigpu_duration.total_seconds():.1f}초")
                 print(f"   - 생성된 프레임: {len(res_frame_list)}개")
                 print(f"   - 사용된 fps: {fps}")
                 print(f"   - 예상 영상 길이: {len(res_frame_list)/fps:.2f}초")
@@ -452,6 +503,8 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
                 print(f"==========================================\n")
             else:
                 print(f"\n⚠️ ========== 멀티 GPU 처리 실패 ==========")
+                print(f"   ⏰ 완료 시간: {multigpu_end.strftime('%H:%M:%S')}")
+                print(f"   ⏱️  소요 시간: {multigpu_duration.total_seconds():.1f}초")
                 print(f"   - 생성된 프레임: 0개")
                 print(f"   - 단일 GPU 폴백 모드로 전환")
                 print(f"==========================================\n")
@@ -503,7 +556,9 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
             
     else:
         # 단일 GPU 처리 (기존 방식)
+        singlegpu_start = datetime.now()
         print(f"\n💻 ============ 단일 GPU 처리 시작 ============")
+        print(f"   ⏰ 시작 시간: {singlegpu_start.strftime('%H:%M:%S')}")
         if torch.cuda.device_count() <= 1:
             print(f"   - 사용 가능한 GPU: {torch.cuda.device_count()}개 (멀티 GPU 불가)")
         else:
@@ -553,6 +608,18 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
             # 5. 생성된 이미지들을 결과 리스트에 추가
             for res_frame in recon:
                 res_frame_list.append(res_frame)
+        
+        # 단일 GPU 처리 완료 시간 측정
+        singlegpu_end = datetime.now()
+        singlegpu_duration = singlegpu_end - singlegpu_start
+        print(f"\n💻 ========== 단일 GPU 처리 완료 ==========")
+        print(f"   ⏰ 완료 시간: {singlegpu_end.strftime('%H:%M:%S')}")
+        print(f"   ⏱️  소요 시간: {singlegpu_duration.total_seconds():.1f}초")
+        print(f"   - 생성된 프레임: {len(res_frame_list)}개")
+        print(f"   - 사용된 fps: {fps}")
+        print(f"   - 예상 영상 길이: {len(res_frame_list)/fps:.2f}초")
+        print(f"   - 처리 방식: 단일 GPU 처리")
+        print(f"==========================================\n")
             
     # ===== 7단계: 생성된 이미지를 원본 비디오에 합성 =====
     print("pad talking image to original video")
@@ -625,8 +692,9 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
         
     # ===== 8단계: 최종 비디오 생성 =====
-    # 🔍 [DEBUG] 최종 비디오 생성 단계 fps 확인
+    video_generation_start = datetime.now()
     print(f"\n🔍 [DEBUG] 최종 비디오 생성 단계:")
+    print(f"   ⏰ 시작 시간: {video_generation_start.strftime('%H:%M:%S')}")
     print(f"   - 현재 fps 값: {fps}")
     print(f"   - 생성된 프레임 수: {len(res_frame_list) if multi_gpu_success else '단일 GPU 모드'}")
     
@@ -656,16 +724,33 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     # 🔍 [DEBUG] 이미지 → 비디오 변환 정보
     print(f"🔍 [DEBUG] 이미지 → 비디오 변환:")
     print(f"   - 읽어온 이미지 수: {len(images)}개")
+    print(f"   - 멀티 GPU 생성 프레임: {len(res_frame_list) if multi_gpu_success else '단일 GPU 모드'}개")
     print(f"   - 사용할 fps: {fps}")
     print(f"   - 예상 비디오 길이: {len(images)/fps:.2f}초")
     print(f"   - 출력 파일: {output_video}")
+    
+    # 🔍 [VALIDATION] 이미지 수 검증 (강사 강의 영상 처리 정확성 확인)
+    if multi_gpu_success:
+        expected_images = len(res_frame_list)
+        if len(images) != expected_images:
+            print(f"⚠️ [WARNING] 이미지 수 불일치!")
+            print(f"   - 예상: {expected_images}개")
+            print(f"   - 실제: {len(images)}개")
+            print(f"   - 차이: {len(images) - expected_images}개")
+        else:
+            print(f"✅ [VALIDATION] 이미지 수 일치: {len(images)}개")
 
     # 이미지들을 비디오로 저장
     # - 여러 장의 이미지를 순서대로 재생하여 비디오로 만듭니다
     # - FFMPEG 코덱을 사용하여 고품질 비디오 생성
     imageio.mimwrite(output_video, images, 'FFMPEG', fps=fps, codec='libx264', pixelformat='yuv420p')
+    
+    video_generation_end = datetime.now()
+    video_generation_duration = video_generation_end - video_generation_start
+    print(f"⏰ [TIME] 비디오 생성 완료: {video_generation_duration.total_seconds():.1f}초 소요")
 
     # ===== 9단계: 오디오와 비디오 합성 =====
+    audio_merge_start = datetime.now()
     input_video = './temp.mp4'
     # 입력 비디오와 오디오 파일 존재 여부 확인
     if not os.path.exists(input_video):
@@ -680,6 +765,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     
     # 🔍 [DEBUG] 오디오-비디오 합성 단계 fps 확인
     print(f"\n🔍 [DEBUG] 오디오-비디오 합성 단계:")
+    print(f"   ⏰ 시작 시간: {audio_merge_start.strftime('%H:%M:%S')}")
     print(f"   - 원본 비디오 fps: {fps}")
     print(f"   - temp.mp4 fps: {temp_video_fps}")
     print(f"   - 최종 저장에 사용할 fps: {fps}")
@@ -705,11 +791,58 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     # - fps: 실제 비디오 프레임 레이트 사용 (원본과 동일하게 유지)
     print(f"🔍 [DEBUG] 최종 비디오 저장: {output_vid_name}")
     video_clip.write_videofile(output_vid_name, codec='libx264', audio_codec='aac', fps=fps)
+    
+    audio_merge_end = datetime.now()
+    audio_merge_duration = audio_merge_end - audio_merge_start
+    print(f"⏰ [TIME] 오디오-비디오 합성 완료: {audio_merge_duration.total_seconds():.1f}초 소요")
 
-    # 임시 파일 정리
-    os.remove("temp.mp4")  # 임시 비디오 파일 삭제
-    #shutil.rmtree(result_img_save_path)  # 임시 이미지 폴더 삭제 (주석 처리됨)
-    print(f"result is save to {output_vid_name}")
+    # 🔧 [CLEANUP] 임시 파일 정리 (강사 강의 영상 처리 후 정리)
+    print(f"\n🧹 [CLEANUP] 임시 파일 정리 시작...")
+    
+    # temp.mp4 삭제
+    if os.path.exists("temp.mp4"):
+        os.remove("temp.mp4")
+        print(f"✅ [CLEANUP] temp.mp4 삭제 완료")
+    
+    # 임시 이미지 폴더 삭제 (메모리 절약)
+    if os.path.exists(result_img_save_path):
+        import shutil
+        shutil.rmtree(result_img_save_path)
+        print(f"✅ [CLEANUP] 임시 이미지 폴더 삭제 완료: {result_img_save_path}")
+    
+    # ⏰ [TIME] 전체 처리 완료 시간 기록 및 통계 출력
+    end_time = datetime.now()
+    total_duration = end_time - start_time
+    
+    # 시간을 시:분:초 형태로 변환
+    total_seconds = int(total_duration.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    
+    print(f"\n⏰ ========== 강사 강의 영상 립싱크 처리 완료 ==========")
+    print(f"   🕐 시작 시간: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   🕕 종료 시간: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   ⏱️  총 소요 시간: {hours:02d}:{minutes:02d}:{seconds:02d}")
+    print(f"   📊 단계별 소요 시간:")
+    if 'preprocessing_duration' in locals():
+        print(f"      - 얼굴 전처리: {preprocessing_duration.total_seconds():.1f}초")
+    if 'multigpu_duration' in locals():
+        print(f"      - 멀티 GPU 처리: {multigpu_duration.total_seconds():.1f}초")
+    if 'singlegpu_duration' in locals():
+        print(f"      - 단일 GPU 처리: {singlegpu_duration.total_seconds():.1f}초")
+    if 'video_generation_duration' in locals():
+        print(f"      - 비디오 생성: {video_generation_duration.total_seconds():.1f}초")
+    if 'audio_merge_duration' in locals():
+        print(f"      - 오디오 합성: {audio_merge_duration.total_seconds():.1f}초")
+    print(f"   📁 처리 결과:")
+    print(f"      - 입력 비디오: {os.path.basename(video_path)}")
+    print(f"      - 입력 오디오: {os.path.basename(audio_path)}")
+    print(f"      - 출력 파일: {os.path.basename(output_vid_name)}")
+    print(f"   🎉 [SUCCESS] 최종 결과 저장 완료: {output_vid_name}")
+    print(f"   🧹 [CLEANUP] 모든 임시 파일 정리 완료")
+    print(f"=======================================================")
+    
     return output_vid_name,bbox_shift_text
 
 

@@ -185,7 +185,12 @@ def get_landmark_and_bbox(img_list, upperbondrange=0):
     average_range_minus = []
     average_range_plus = []
     
-    for fb in tqdm(batches):
+    # 강사 강의 영상 처리를 위한 얼굴 추적 변수 (움직임과 가림 현상 대응)
+    last_valid_coord = None  # 마지막으로 성공한 얼굴 좌표
+    failed_detection_count = 0  # 연속 실패 횟수
+    total_frames = len(batches)
+    
+    for batch_idx, fb in enumerate(tqdm(batches)):
         # 1. DWPose 모델을 사용하여 얼굴 랜드마크 추출
         results = inference_topdown(model, np.asarray(fb)[0])
         results = merge_data_samples(results)
@@ -200,8 +205,18 @@ def get_landmark_and_bbox(img_list, upperbondrange=0):
         
         # 4. 각 얼굴에 대해 정확한 영역 계산
         for j, f in enumerate(bbox):
-            if f is None:  # 얼굴을 찾지 못한 경우
-                coords_list += [coord_placeholder]
+            if f is None:  # 얼굴을 찾지 못한 경우 (강사 움직임이나 핸드마이크로 가려짐)
+                failed_detection_count += 1
+                
+                if last_valid_coord is not None:
+                    # 이전 프레임의 성공한 좌표 사용 (강사 강의 영상의 연속성 보장)
+                    coords_list += [last_valid_coord]
+                    if failed_detection_count <= 5:  # 처음 5번 실패까지만 로그 출력
+                        print(f"🔍 [FACE TRACKING] 프레임 {batch_idx+1}/{total_frames}: 얼굴 감지 실패, 이전 좌표 사용 (연속 실패: {failed_detection_count}회)")
+                else:
+                    # 첫 프레임부터 실패하는 경우에만 placeholder 사용
+                    coords_list += [coord_placeholder]
+                    print(f"⚠️ [FACE TRACKING] 프레임 {batch_idx+1}/{total_frames}: 초기 얼굴 감지 실패, 기본값 사용")
                 continue
             
             # 5. 얼굴의 중심점과 조정 범위 계산
@@ -228,14 +243,39 @@ def get_landmark_and_bbox(img_list, upperbondrange=0):
             # 9. 계산된 영역이 유효한지 확인
             if y2-y1 <= 0 or x2-x1 <= 0 or x1 < 0:  # 잘못된 영역인 경우
                 coords_list += [f]  # 원본 얼굴 감지 결과 사용
+                last_valid_coord = f  # 성공한 좌표로 업데이트 (강사 강의 영상 추적용)
                 w, h = f[2]-f[0], f[3]-f[1]
                 print("error bbox:", f)
             else:
                 coords_list += [f_landmark]  # 계산된 정확한 영역 사용
+                last_valid_coord = f_landmark  # 성공한 좌표로 업데이트 (강사 강의 영상 추적용)
+            
+            # 성공적으로 얼굴을 감지했으므로 실패 횟수 리셋
+            if failed_detection_count > 0:
+                print(f"✅ [FACE TRACKING] 프레임 {batch_idx+1}/{total_frames}: 얼굴 감지 복구 (이전 {failed_detection_count}회 실패)")
+                failed_detection_count = 0
     
-    # 10. 조정 가능한 범위 정보 출력
+    # 10. 강사 강의 영상 얼굴 추적 결과 통계 출력
+    successful_detections = len([coord for coord in coords_list if coord != coord_placeholder])
+    failed_detections = len(coords_list) - successful_detections
+    success_rate = (successful_detections / len(coords_list)) * 100 if coords_list else 0
+    
+    print(f"\n🎯 [FACE TRACKING] 강사 강의 영상 얼굴 추적 결과:")
+    print(f"   - 전체 프레임: {len(coords_list)}개")
+    print(f"   - 성공한 감지: {successful_detections}개")
+    print(f"   - 실패한 감지: {failed_detections}개")
+    print(f"   - 성공률: {success_rate:.1f}%")
+    if failed_detections > 0:
+        print(f"   ℹ️  실패한 프레임은 이전 프레임 좌표로 보정되었습니다")
+    
+    # 11. 조정 가능한 범위 정보 출력
     print("********************************************bbox_shift parameter adjustment**********************************************************")
-    print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
+    if average_range_minus and average_range_plus:
+        avg_minus = int(sum(average_range_minus) / len(average_range_minus))
+        avg_plus = int(sum(average_range_plus) / len(average_range_plus))
+        print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{avg_minus}~{avg_plus} ] , the current value: {upperbondrange}")
+    else:
+        print(f"Total frame:「{len(frames)}」 Manually adjust range : [ 얼굴 감지 실패로 계산 불가 ] , the current value: {upperbondrange}")
     print("*************************************************************************************************************************************")
     return coords_list, frames
 
