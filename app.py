@@ -214,7 +214,7 @@ def fast_check_ffmpeg():
 def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
               left_cheek_width=90, right_cheek_width=90, 
               enable_occlusion_detection=True, occlusion_sensitivity=0.3,
-              use_multi_gpu=True, num_gpus=None, segment_duration=30,
+              use_multi_gpu=True, num_gpus=None, batch_size=4,
               progress=gr.Progress(track_tqdm=True)):
     """
     메인 추론 함수 - 오디오와 비디오를 입력받아 말하는 얼굴을 생성
@@ -231,7 +231,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     Args:
         use_multi_gpu: 멀티 GPU 병렬 처리 사용 여부
         num_gpus: 사용할 GPU 개수 (None이면 자동 감지)
-        segment_duration: 각 세그먼트 길이 (초, 기본값 30초)
+        batch_size: 각 GPU가 처리할 배치 크기 (기본값 4프레임)
     """
     
     # ===== 1단계: 파라미터 설정 및 초기화 =====
@@ -239,7 +239,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     args_dict = {
         "result_dir": './results/output', 
         "fps": 50, 
-        "batch_size": 4, 
+        "batch_size": batch_size,  # UI에서 전달된 배치 크기 사용
         "output_vid_name": '', 
         "use_saved_coord": False,
         "audio_padding_length_left": 0,
@@ -409,7 +409,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
     print(f"🔍 [DEBUG] 멀티 GPU 파라미터 확인:")
     print(f"   - use_multi_gpu: {use_multi_gpu}")
     print(f"   - num_gpus: {num_gpus}")
-    print(f"   - segment_duration: {segment_duration}")
+    print(f"   - batch_size: {batch_size}")
     print(f"   - torch.cuda.device_count(): {torch.cuda.device_count()}")
     print(f"   - use_multi_gpu and torch.cuda.device_count() > 1: {use_multi_gpu and torch.cuda.device_count() > 1}")
     
@@ -424,25 +424,25 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         print(f"   시스템 정보:")
         print(f"   - 사용 가능한 GPU: {torch.cuda.device_count()}개")
         print(f"   - 실제 사용할 GPU: {num_gpus if num_gpus else torch.cuda.device_count()}개")
-        print(f"   - 세그먼트 길이: {segment_duration}초")
+        print(f"   - 배치 크기: {batch_size}프레임")
         print(f"   - 오디오 파일: {os.path.basename(audio_path)}")
         print(f"   - 비디오 파일: {os.path.basename(video_path)}")
         print(f"=================================================\n")
         
         from musetalk.utils.multi_gpu_manager import DynamicMultiGPUManager
         
-        # 동적 멀티 GPU 매니저 초기화
+        # 동적 멀티 GPU 매니저 초기화 (세그먼트 분할 제거)
         # Gradio에서 전달된 num_gpus가 float일 수 있으므로 int로 변환
         num_gpus_int = int(num_gpus) if num_gpus is not None else None
-        segment_duration_int = int(segment_duration) if segment_duration is not None else 30
+        batch_size_int = int(batch_size) if batch_size is not None else 4
         
         print(f"🔍 [DEBUG] 변환된 파라미터:")
         print(f"   - num_gpus_int: {num_gpus_int}")
-        print(f"   - segment_duration_int: {segment_duration_int}")
+        print(f"   - batch_size_int: {batch_size_int}")
         
         multi_gpu_manager = DynamicMultiGPUManager(
             num_gpus=num_gpus_int,
-            segment_duration=segment_duration_int
+            segment_duration=0  # 세그먼트 분할 비활성화
         )
         
         # 모델 경로 설정
@@ -467,21 +467,26 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         
         model_config = {
             'fps': fps,  # 실제 비디오 fps 사용 (args.fps 대신)
-            'batch_size': args.batch_size,
+            'batch_size': batch_size_int,  # UI에서 설정한 배치 크기 사용
             'audio_padding_length_left': args.audio_padding_length_left,
             'audio_padding_length_right': args.audio_padding_length_right,
             'extra_margin': args.extra_margin,
-            'coord_list': coord_list_cycle
+            # 🔧 [MODEL PATHS] 멀티 GPU 배치 처리를 위한 모델 경로 추가
+            'unet_model_path': "./models/musetalkV15/unet.pth",
+            'vae_type': "sd-vae",
+            'unet_config': "./models/musetalkV15/musetalk.json",
+            'whisper_path': 'openai/whisper-tiny'
+            # 🎯 [NO SEGMENTS] 세그먼트 분할 완전 제거 - 배치 단위로만 처리
         }
         
         multi_gpu_success = False
         try:
-            # 멀티 GPU로 완전 동적 처리
-            # 사용자 요구사항에 따라 완전한 동적 작업 분배 방식 사용
-            res_frame_list = multi_gpu_manager.process_with_full_dynamic_queue(
+            # 🎯 [REVOLUTIONARY] 단일 GPU 스타일 멀티 GPU 처리
+            # 세그먼트 분할 없이 배치만 분산하여 단일 GPU 품질 + 멀티 GPU 속도 달성
+            res_frame_list = multi_gpu_manager.process_with_single_gpu_style(
                 audio_path=audio_path,
-                video_frames=frame_list_cycle,
-                coord_list=coord_list_cycle,
+                video_frames=frame_list,  # 순환 리스트 대신 원본 사용
+                coord_list=coord_list,    # 순환 리스트 대신 원본 사용
                 model_config=model_config
             )
             
@@ -1017,17 +1022,17 @@ with gr.Blocks(css=css) as demo:
             
             # 멀티 GPU 관련 컨트롤 추가
             with gr.Group():
-                gr.Markdown("### 완전 동적 멀티 GPU 병렬 처리 설정 (Full Dynamic Multi-GPU Processing)")
+                gr.Markdown("### 🚀 단일 GPU 스타일 멀티 GPU 병렬 처리 (Single-GPU Style Multi-GPU Processing)")
                 use_multi_gpu = gr.Checkbox(label="멀티 GPU 병렬 처리 사용 (Enable Multi-GPU Processing)", value=True,
-                                          info="완전 동적 작업 분배: 먼저 끝나는 GPU가 다음 세그먼트를 즉시 처리")
+                                          info="🎯 혁신적 처리 방식: 단일 GPU 품질 + 멀티 GPU 속도")
                 num_gpus = gr.Slider(label="사용할 GPU 개수 (Number of GPUs)", 
                                    minimum=1, maximum=8, value=torch.cuda.device_count(), step=1,
-                                   info="사용할 GPU 개수 (모든 GPU가 동적으로 작업을 분배받음)")
-                segment_duration = gr.Slider(label="세그먼트 길이 (Segment Duration, seconds)", 
-                                           minimum=0, maximum=60, value=5, step=5,
-                                           info="각 세그먼트 길이 (초) - 더 짧을수록 GPU 활용률 향상")
+                                   info="사용할 GPU 개수 (배치 단위로 동적 분산 처리)")
+                batch_size = gr.Slider(label="배치 크기 (Batch Size)", 
+                                     minimum=1, maximum=16, value=4, step=1,
+                                     info="각 GPU가 처리할 배치 크기 (4프레임 권장)")
                 gr.Markdown(f"**현재 사용 가능한 GPU: {torch.cuda.device_count()}개**")
-                gr.Markdown("**동작 방식:** 1분 영상 + 30초 세그먼트 + 4개 GPU = 세그먼트 1,2,3,4를 병렬 처리 → 3번 GPU 완료 시 5번 세그먼트 즉시 할당 → 최대 효율 달성")
+                gr.Markdown("**🎯 새로운 동작 방식:** 전체 비디오를 메인 GPU에서 통합 처리 → 배치 단위로 워커 GPU들에 분산 → 완벽한 시간적 연속성 보장")
             
             bbox_shift_scale = gr.Textbox(label="'left_cheek_width'와 'right_cheek_width' 파라미터는 파싱 모델이 'jaw'일 때 좌우 볼 편집 범위를 결정합니다. 'extra_margin' 파라미터는 턱의 움직임 범위를 결정합니다. 사용자는 이 세 파라미터를 자유롭게 조정하여 더 나은 인페인팅 결과를 얻을 수 있습니다. 가림 감지 기능은 마이크 등의 물체에 의해 얼굴이 가려진 부분에서 자연스러운 립싱크를 제공합니다.")
 
@@ -1058,7 +1063,7 @@ with gr.Blocks(css=css) as demo:
             occlusion_sensitivity,
             use_multi_gpu,
             num_gpus,
-            segment_duration
+            batch_size
         ],
         outputs=[out1,bbox_shift_scale]
     )

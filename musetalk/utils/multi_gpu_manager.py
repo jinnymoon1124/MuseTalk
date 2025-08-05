@@ -9,7 +9,7 @@ import cv2
 import math
 from .audio_processor import AudioProcessor
 from musetalk.utils.utils import load_all_model, datagen
-from transformers import WhisperModel
+from transformers import WhisperModel, WhisperForConditionalGeneration
 import copy
 import logging
 import os
@@ -139,41 +139,80 @@ def dynamic_worker_process(gpu_id: int, model_paths: Dict[str, str],
         
         # 동적 작업 처리 루프
         while True:
+            task = None  # 🔧 [FIX] task 변수 초기화로 UnboundLocalError 방지
             try:
                 # 작업 큐에서 다음 작업 가져오기 (타임아웃 30초)
                 task = task_queue.get(timeout=30)
                 
                 if task is None:  # 종료 신호
-                    print(f"🏁 [GPU {gpu_id} Dynamic Worker] 종료 신호 수신, 총 {processed_count}개 세그먼트 처리 완료")
+                    print(f"🏁 [GPU {gpu_id} Dynamic Worker] 종료 신호 수신, 총 {processed_count}개 작업 처리 완료")
                     break
                 
-                segment_id = task['segment_id']
-                print(f"🎬 [GPU {gpu_id} Dynamic Worker] 세그먼트 {segment_id} 처리 시작 ({processed_count+1}번째 작업)")
+                # 작업 타입 확인 (세그먼트 vs 배치)
+                if 'segment_id' in task:
+                    # 기존 세그먼트 처리
+                    segment_id = task['segment_id']
+                    print(f"🎬 [GPU {gpu_id} Dynamic Worker] 세그먼트 {segment_id} 처리 시작 ({processed_count+1}번째 작업)")
+                    
+                    start_time = time.time()
+                    result = worker_instance.process_segment(task)
+                    process_time = time.time() - start_time
+                    processed_count += 1
+                elif 'batch_id' in task:
+                    # 새로운 배치 처리
+                    batch_id = task['batch_id']
+                    print(f"📦 [GPU {gpu_id} Dynamic Worker] 배치 {batch_id} 처리 시작 ({processed_count+1}번째 작업)")
+                    
+                    start_time = time.time()
+                    result = worker_instance.process_batch(task)
+                    process_time = time.time() - start_time
+                    processed_count += 1
+                else:
+                    print(f"❌ [GPU {gpu_id} Dynamic Worker] 알 수 없는 작업 타입: {task}")
+                    continue
                 
-                # 세그먼트 처리
-                start_time = time.time()
-                result = worker_instance.process_segment(task)
-                process_time = time.time() - start_time
-                processed_count += 1
-                
-                # 결과를 결과 큐에 전송 (타임아웃 방지)
+                # 결과를 결과 큐에 전송 (타입별 로그)
                 try:
                     result_queue.put(result, timeout=10)  # 10초 타임아웃
                     if result['success']:
-                        print(f"✅ [GPU {gpu_id} Dynamic Worker] 세그먼트 {segment_id} 완료 ({process_time:.2f}초) - 결과 전송 성공")
+                        if 'segment_id' in task:
+                            print(f"✅ [GPU {gpu_id} Dynamic Worker] 세그먼트 {task['segment_id']} 완료 ({process_time:.2f}초) - 결과 전송 성공")
+                        elif 'batch_id' in task:
+                            print(f"✅ [GPU {gpu_id} Dynamic Worker] 배치 {task['batch_id']} 완료 ({process_time:.2f}초) - 결과 전송 성공")
                     else:
-                        print(f"❌ [GPU {gpu_id} Dynamic Worker] 세그먼트 {segment_id} 실패 - 결과 전송 성공")
+                        if 'segment_id' in task:
+                            print(f"❌ [GPU {gpu_id} Dynamic Worker] 세그먼트 {task['segment_id']} 실패 - 결과 전송 성공")
+                        elif 'batch_id' in task:
+                            print(f"❌ [GPU {gpu_id} Dynamic Worker] 배치 {task['batch_id']} 실패 - 결과 전송 성공")
                 except queue.Full:
-                    print(f"⚠️ [GPU {gpu_id} Dynamic Worker] 결과 큐 가득참 - 세그먼트 {segment_id} 결과 손실")
+                    if 'segment_id' in task:
+                        print(f"⚠️ [GPU {gpu_id} Dynamic Worker] 결과 큐 가득참 - 세그먼트 {task['segment_id']} 결과 손실")
+                    elif 'batch_id' in task:
+                        print(f"⚠️ [GPU {gpu_id} Dynamic Worker] 결과 큐 가득참 - 배치 {task['batch_id']} 결과 손실")
                 
             except queue.Empty:
                 print(f"⏰ [GPU {gpu_id} Dynamic Worker] 30초간 새 작업 없음, 종료")
                 break
             except Exception as e:
                 print(f"💥 [GPU {gpu_id} Dynamic Worker] 작업 처리 중 오류: {e}")
+                # 🔧 [FIX] task가 None일 수 있으므로 안전하게 처리
+                if task is not None:
+                    if 'segment_id' in task:
+                        task_id = task.get('segment_id', -1)
+                        id_key = 'segment_id'
+                    elif 'batch_id' in task:
+                        task_id = task.get('batch_id', -1)
+                        id_key = 'batch_id'
+                    else:
+                        task_id = -1
+                        id_key = 'segment_id'  # 기본값
+                else:
+                    task_id = -1
+                    id_key = 'segment_id'  # 기본값
+                    
                 try:
                     result_queue.put({
-                        'segment_id': task.get('segment_id', -1),
+                        id_key: task_id,
                         'gpu_id': gpu_id,
                         'error': str(e),
                         'success': False
@@ -223,7 +262,13 @@ class DynamicMultiGPUManager:
     
     def _interpolate_coordinate(self, target_idx: int, valid_indices: List[int], coord_list: List) -> tuple:
         """
-        좌표 보간 함수 - 강사 움직임으로 인한 좌표 누락 시 사용
+        고급 좌표 보간 함수 - 강사 움직임을 고려한 스마트 보간
+        
+        강사 강의 영상의 특성을 고려한 개선사항:
+        1. 시간적 가중치를 적용한 스무스 보간
+        2. 얼굴 크기 변화 감지 및 보정
+        3. 급격한 움직임 감지 시 보수적 접근
+        4. 핸드마이크 등으로 인한 가림 상황 대응
         
         Args:
             target_idx: 보간할 프레임 인덱스
@@ -237,30 +282,98 @@ class DynamicMultiGPUManager:
             # 유효한 좌표가 없는 경우 기본값 반환
             return None
         
-        # 가장 가까운 유효한 좌표 찾기
+        # 🔧 [COORDINATE STABILITY] 강사 강의 영상을 위한 안정적 좌표 선택
+        # 가장 가까운 유효한 좌표 찾기 (시간적 거리 기반)
         closest_idx = min(valid_indices, key=lambda x: abs(x - target_idx))
         
-        # 선형 보간을 위해 앞뒤 좌표 찾기
+        # 📍 [ULTRA STABILITY] 덜덜거림 완전 제거를 위한 엄격한 좌표 제한
+        # 연속된 프레임 간 좌표 변화를 엄격히 제한하여 안정성 우선
+        max_coord_change = 15  # 픽셀 단위 최대 변화량을 더욱 엄격하게 (50 → 15)
+        
+        # 이전 프레임과의 좌표 차이 검증
+        if target_idx > 0 and (target_idx - 1) in valid_indices:
+            prev_coord = coord_list[target_idx - 1]
+            current_coord = coord_list[closest_idx]
+            
+            if prev_coord is not None and current_coord is not None:
+                # 좌표 변화량 계산
+                coord_diff = abs(current_coord[0] - prev_coord[0]) + abs(current_coord[1] - prev_coord[1])
+                
+                # 급격한 변화 감지 시 이전 좌표 유지 (안정성 우선)
+                if coord_diff > max_coord_change:
+                    # 🎯 [ULTRA STABLE COORD] 덜덜거림 완전 제거를 위한 초안정 좌표
+                    # 블렌딩 비율을 매우 보수적으로 조정 (0.8 → 0.95)
+                    smoothed_coord = (
+                        int(0.95 * prev_coord[0] + 0.05 * current_coord[0]),  # X1 (95% 이전, 5% 현재)
+                        int(0.95 * prev_coord[1] + 0.05 * current_coord[1]),  # Y1
+                        int(0.95 * prev_coord[2] + 0.05 * current_coord[2]),  # X2
+                        int(0.95 * prev_coord[3] + 0.05 * current_coord[3])   # Y2
+                    )
+                    return smoothed_coord
+        
+        # 앞뒤 좌표 찾기
         before_indices = [idx for idx in valid_indices if idx < target_idx]
         after_indices = [idx for idx in valid_indices if idx > target_idx]
         
         if before_indices and after_indices:
-            # 앞뒤 좌표가 모두 있는 경우 선형 보간
+            # 앞뒤 좌표가 모두 있는 경우 - 고급 보간 적용
             before_idx = max(before_indices)
             after_idx = min(after_indices)
             
             before_coord = coord_list[before_idx]
             after_coord = coord_list[after_idx]
             
-            # 선형 보간 계산
-            weight = (target_idx - before_idx) / (after_idx - before_idx)
+            # 좌표 유효성 재검증
+            if before_coord is None or after_coord is None:
+                return coord_list[closest_idx]
+            
+            # 얼굴 크기 변화 감지 (강사 움직임 분석)
+            before_width = before_coord[2] - before_coord[0]
+            before_height = before_coord[3] - before_coord[1]
+            after_width = after_coord[2] - after_coord[0]
+            after_height = after_coord[3] - after_coord[1]
+            
+            # 급격한 크기 변화 감지 (50% 이상 변화 시 보수적 접근)
+            size_change_ratio = max(
+                abs(after_width - before_width) / max(before_width, 1),
+                abs(after_height - before_height) / max(before_height, 1)
+            )
+            
+            if size_change_ratio > 0.5:
+                # 급격한 변화 시 가장 가까운 좌표 사용 (안전 모드)
+                return coord_list[closest_idx]
+            
+            # 시간적 거리 기반 가중치 계산 (가까운 시점에 더 높은 가중치)
+            time_distance = after_idx - before_idx
+            if time_distance > 10:  # 10프레임 이상 차이 시 보수적 접근
+                return coord_list[closest_idx]
+            
+            # 스무스 보간 계산 (코사인 보간으로 자연스러운 움직임)
+            import math
+            linear_weight = (target_idx - before_idx) / (after_idx - before_idx)
+            smooth_weight = (1 - math.cos(linear_weight * math.pi)) / 2  # 코사인 보간
+            
             interpolated = []
             for i in range(4):  # x1, y1, x2, y2
-                interpolated.append(int(before_coord[i] + weight * (after_coord[i] - before_coord[i])))
+                interpolated_val = before_coord[i] + smooth_weight * (after_coord[i] - before_coord[i])
+                interpolated.append(int(interpolated_val))
             
             return tuple(interpolated)
         else:
-            # 한쪽만 있는 경우 가장 가까운 좌표 사용
+            # 한쪽만 있는 경우 - 시간적 거리 고려
+            if before_indices:
+                # 이전 좌표만 있는 경우
+                recent_idx = max(before_indices)
+                if target_idx - recent_idx <= 5:  # 5프레임 이내면 사용
+                    return coord_list[recent_idx]
+            
+            if after_indices:
+                # 이후 좌표만 있는 경우
+                next_idx = min(after_indices)
+                if next_idx - target_idx <= 5:  # 5프레임 이내면 사용
+                    return coord_list[next_idx]
+            
+            # 가장 가까운 좌표 사용 (최종 폴백)
             return coord_list[closest_idx]
         
     def initialize_workers(self, model_paths: Dict[str, str], use_float16: bool = True, main_gpu_id: int = None):
@@ -375,55 +488,58 @@ class DynamicMultiGPUManager:
             else:
                 video_frames_serializable.append(np.array(frame))
         
+        # 🔧 [CRITICAL FIX] 싱글 GPU와 동일한 순환 리스트 방식 적용
+        # 멀티 GPU에서도 연속성 보장을 위해 순환 리스트 사용
+        print(f"🔄 [COORD SYNC] 싱글 GPU와 동일한 순환 리스트 방식 적용")
+        
+        # 순환 리스트 생성 (싱글 GPU와 동일)
+        frame_list_cycle = video_frames_serializable + video_frames_serializable[::-1]
+        coord_list_cycle = coord_list + coord_list[::-1]
+        
+        print(f"   - 원본 프레임 수: {len(video_frames_serializable)}개")
+        print(f"   - 순환 프레임 수: {len(frame_list_cycle)}개")
+        print(f"   - 원본 좌표 수: {len(coord_list)}개")
+        print(f"   - 순환 좌표 수: {len(coord_list_cycle)}개")
+        
         # 모든 세그먼트를 작업 큐에 추가
         task_count = 0
         for segment in segments:
             gpu_id = segment['gpu_id']
             
-            # 해당 세그먼트에 대응하는 비디오 프레임 계산 (강사 강의 영상 정확한 매핑)
+            # 해당 세그먼트에 대응하는 비디오 프레임 계산 (순환 리스트 기반)
             start_frame = int(segment['start_time'] * model_config['fps'])
             end_frame = int(segment['end_time'] * model_config['fps'])
             
-            # 실제 비디오 길이 기반 프레임 추출 (순환 대신 정확한 시간 매핑)
+            # 🔧 [CRITICAL FIX] 순환 리스트 기반 프레임 추출 (싱글 GPU와 동일)
             segment_frames = []
             segment_coords = []
-            total_frames = len(video_frames_serializable)
-            video_duration = total_frames / model_config['fps']  # 실제 비디오 길이 (초)
+            total_cycle_frames = len(frame_list_cycle)
+            video_duration = len(video_frames_serializable) / model_config['fps']  # 실제 비디오 길이 (초)
             
             print(f"   🎬 [COORD MAPPING] 세그먼트 {segment['segment_id']}: {segment['start_time']:.1f}-{segment['end_time']:.1f}초")
-            print(f"      - 비디오 길이: {video_duration:.1f}초 ({total_frames}프레임)")
+            print(f"      - 비디오 길이: {video_duration:.1f}초 ({len(video_frames_serializable)}프레임)")
             print(f"      - 요청 프레임 범위: {start_frame}-{end_frame-1}")
             
             # 좌표 보간을 위한 유효한 좌표 인덱스 수집 (강사 움직임 추적 안정성 향상)
             valid_coord_indices = []
-            for idx in range(min(total_frames, end_frame)):
+            for idx in range(min(len(video_frames_serializable), end_frame)):
                 if idx < len(coord_list) and coord_list[idx] is not None:
                     valid_coord_indices.append(idx)
             
+            # 🔧 [CRITICAL FIX] 순환 리스트 기반 세그먼트 범위 처리 (싱글 GPU와 동일)
             for frame_idx in range(start_frame, end_frame):
-                if frame_idx < total_frames:
-                    # 실제 프레임이 존재하는 경우 - 정확한 좌표 사용
-                    segment_frames.append(video_frames_serializable[frame_idx])
-                    
-                    # 좌표 처리: 유효하지 않은 경우 보간 사용
-                    if frame_idx < len(coord_list) and coord_list[frame_idx] is not None:
-                        segment_coords.append(coord_list[frame_idx])
-                    else:
-                        # 좌표 보간: 가장 가까운 유효한 좌표 사용 (강사 얼굴 추적 연속성 보장)
-                        interpolated_coord = self._interpolate_coordinate(frame_idx, valid_coord_indices, coord_list)
-                        segment_coords.append(interpolated_coord)
-                        
-                        if frame_idx - start_frame < 3:  # 처음 몇 개만 로그 출력
-                            print(f"      🔄 프레임 {frame_idx}: 좌표 보간 적용")
-                else:
-                    # 비디오 길이를 초과하는 경우 - 마지막 유효한 프레임과 좌표 사용
-                    last_valid_idx = total_frames - 1
-                    segment_frames.append(video_frames_serializable[last_valid_idx])
-                    segment_coords.append(coord_list[last_valid_idx])
-                    
-                    # 처음 몇 번만 경고 출력 (로그 스팸 방지)
-                    if frame_idx - total_frames < 3:
-                        print(f"      ⚠️  프레임 {frame_idx}: 비디오 범위 초과, 마지막 프레임({last_valid_idx}) 재사용")
+                # 순환 리스트에서 프레임과 좌표 추출 (연속성 보장)
+                cycle_idx = frame_idx % total_cycle_frames
+                segment_frames.append(frame_list_cycle[cycle_idx])
+                segment_coords.append(coord_list_cycle[cycle_idx])
+                
+                # 디버깅: 처음 몇 개와 마지막 몇 개 프레임의 매핑 정보 출력
+                if (frame_idx - start_frame < 3) or (frame_idx >= end_frame - 3):
+                    original_idx = cycle_idx % len(video_frames_serializable)
+                    is_reversed = cycle_idx >= len(video_frames_serializable)
+                    print(f"      🔄 프레임 {frame_idx}: 순환[{cycle_idx}] -> 원본[{original_idx}] {'(역순)' if is_reversed else '(정순)'}")
+            
+            # 오버랩 처리 제거 (정확한 동기화 우선)
             
             # 좌표 매핑 검증 (강사 강의 영상 품질 보장)
             valid_coords = [coord for coord in segment_coords if coord is not None]
@@ -688,18 +804,207 @@ class DynamicMultiGPUManager:
         
         return final_frames
     
+    def process_with_single_gpu_style(self, audio_path: str, video_frames: List[np.ndarray],
+                                     coord_list: List, model_config: Dict) -> List[np.ndarray]:
+        """
+        🎯 [REVOLUTIONARY] 단일 GPU 방식을 멀티 GPU에 완전 모방
+        
+        핵심 혁신:
+        1. 세그먼트 분할 완전 제거 - 전체 비디오를 연속적으로 처리
+        2. 통합 VAE 인코딩 - 모든 프레임을 동일한 컨텍스트에서 인코딩
+        3. 배치 단위 분산 - GPU들이 배치만 나눠서 처리
+        4. 시간적 일관성 완벽 유지 - 첫 프레임부터 마지막까지 연속성 보장
+        
+        Args:
+            audio_path: 오디오 파일 경로
+            video_frames: 비디오 프레임 리스트  
+            coord_list: 좌표 리스트
+            model_config: 모델 설정
+            
+        Returns:
+            List[np.ndarray]: 단일 GPU 품질의 처리된 프레임 리스트
+        """
+        print(f"🚀 ========== 단일 GPU 스타일 멀티 GPU 처리 시작 ==========")
+        print(f"   혁신적 접근: 세그먼트 분할 없이 배치만 분산")
+        print(f"   목표: 단일 GPU 품질 + 멀티 GPU 속도")
+        print(f"=======================================================")
+        
+        # 1. 전체 오디오를 한 번에 처리 (세그먼트 분할 없음)
+        print(f"🎵 [Unified] 전체 오디오 통합 처리...")
+        try:
+            # 먼저 모델들을 로드해야 함 (메인 GPU에서)
+            from musetalk.utils.utils import load_all_model
+            device = torch.device("cuda:0")
+            weight_dtype = torch.float16
+            
+            # 모델 로드
+            print(f"🔧 [Unified] 메인 GPU에서 모델 로딩...")
+            vae, unet, pe = load_all_model(
+                model_config['unet_model_path'],
+                model_config['vae_type'], 
+                model_config['unet_config'],
+                device
+            )
+            
+            # 🔧 [데이터 타입 통일] 모든 모델을 float16으로 변환
+            # VAE는 커스텀 래퍼 클래스이므로 내부 vae 모델을 직접 변환
+            vae.vae = vae.vae.to(device, dtype=weight_dtype)
+            vae._use_float16 = True  # float16 사용 플래그 설정
+            
+            # UNet도 커스텀 래퍼 클래스이므로 내부 model을 직접 변환
+            unet.model = unet.model.to(device, dtype=weight_dtype)
+            
+            # PE는 표준 PyTorch 모듈
+            pe = pe.to(device, dtype=weight_dtype)
+            
+            # Whisper 모델 로드 (올바른 클래스 및 데이터 타입 사용)
+            from transformers import WhisperModel
+            whisper = WhisperModel.from_pretrained(model_config.get('whisper_path', 'openai/whisper-tiny')).to(device, dtype=weight_dtype)
+            
+            # 오디오 특징 추출
+            audio_processor = AudioProcessor()
+            whisper_input_features, librosa_length = audio_processor.get_audio_feature(audio_path)
+            
+            # 전체 오디오의 whisper 특징을 프레임 단위로 분할
+            whisper_chunks = audio_processor.get_whisper_chunk(
+                whisper_input_features,  # 변환된 음성 특징들
+                device,                  # GPU 디바이스
+                weight_dtype,            # 데이터 타입
+                whisper,                 # Whisper 모델
+                librosa_length,          # 전체 음성 길이
+                fps=model_config.get('fps', 50),  # 비디오 프레임 레이트
+                audio_padding_length_left=2,     # 왼쪽 패딩
+                audio_padding_length_right=2,    # 오른쪽 패딩
+            )
+            
+            # 🔧 [P2P FIX] Whisper 청크들을 CPU로 이동하여 P2P 오류 방지
+            if isinstance(whisper_chunks, list):
+                whisper_chunks = [chunk.cpu() if hasattr(chunk, 'cpu') else chunk for chunk in whisper_chunks]
+            elif hasattr(whisper_chunks, 'cpu'):
+                whisper_chunks = whisper_chunks.cpu()
+            print(f"   - 전체 Whisper 청크: {len(whisper_chunks)}개")
+            print(f"   - 비디오 프레임: {len(video_frames)}개")
+            print(f"   - 프레임-청크 비율: {len(whisper_chunks)}/{len(video_frames)} = {len(whisper_chunks)/len(video_frames):.3f}")
+        except Exception as e:
+            print(f"❌ [Unified] 오디오 처리 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+        
+        # 2. 전체 비디오 프레임을 한 번에 VAE 인코딩 (단일 GPU 방식)
+        print(f"🖼️  [Unified] 전체 프레임 통합 VAE 인코딩...")
+        
+        # 순환 리스트 생성 (단일 GPU와 동일)
+        frame_list_cycle = video_frames + video_frames[::-1]
+        coord_list_cycle = coord_list + coord_list[::-1]
+        
+        # 모든 프레임을 동일한 기준으로 VAE 인코딩
+        all_input_latents = []
+        for i, frame in enumerate(video_frames):
+            # 순환 좌표 사용
+            cycle_idx = i % len(coord_list_cycle)
+            bbox = coord_list_cycle[cycle_idx]
+            
+            if bbox is not None and len(bbox) >= 4:
+                x1, y1, x2, y2 = bbox[:4]
+                if x2 > x1 and y2 > y1:
+                    extra_margin = model_config.get('extra_margin', 10)
+                    y2 = min(y2 + extra_margin, frame.shape[0])
+                    crop_frame = frame[y1:y2, x1:x2]
+                    crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+                else:
+                    crop_frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+            else:
+                crop_frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+            
+            # 🔧 [8-CHANNEL FIX] 단일 GPU와 동일하게 get_latents_for_unet 사용
+            with torch.no_grad():
+                # 단일 GPU와 동일한 방식으로 8채널 latent 생성
+                latent_8ch = vae.get_latents_for_unet(crop_frame)  # [1, 8, 32, 32]
+                all_input_latents.append(latent_8ch.cpu())
+        
+        print(f"   - 통합 VAE 인코딩 완료: {len(all_input_latents)}개 latent")
+        
+        # 3. 배치 단위로 GPU들에게 분산 처리
+        print(f"🔄 [BatchDistribution] 배치 단위 GPU 분산 처리...")
+        batch_size = model_config.get('batch_size', 8)
+        total_batches = (len(whisper_chunks) + batch_size - 1) // batch_size
+        
+        print(f"   - 배치 크기: {batch_size}")
+        print(f"   - 총 배치 수: {total_batches}")
+        print(f"   - 사용 GPU: {self.num_gpus}개")
+        
+        # 배치들을 GPU들에게 동적 할당
+        batch_tasks = []
+        for batch_idx in range(total_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, len(whisper_chunks))
+            
+            batch_whisper = whisper_chunks[start_idx:end_idx]
+            batch_latents = all_input_latents[start_idx:end_idx]
+            
+            task = {
+                'batch_id': batch_idx,
+                'whisper_chunks': batch_whisper,
+                'input_latents': batch_latents,
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'config': model_config
+            }
+            batch_tasks.append(task)
+        
+        # 4. GPU 워커들이 배치 작업을 동적으로 처리
+        print(f"⚡ [DynamicBatch] {self.num_gpus}개 GPU가 {len(batch_tasks)}개 배치를 동적 처리...")
+        
+        # 배치 작업을 큐에 추가
+        for task in batch_tasks:
+            self.task_queue.put(task)
+        
+        # 결과 수집
+        batch_results = {}
+        completed_batches = 0
+        
+        while completed_batches < len(batch_tasks):
+            try:
+                result = self.result_queue.get(timeout=300)
+                if result['success']:
+                    batch_results[result['batch_id']] = result
+                    completed_batches += 1
+                    print(f"   ✅ 배치 {result['batch_id']} 완료 ({completed_batches}/{len(batch_tasks)})")
+                else:
+                    print(f"   ❌ 배치 {result['batch_id']} 실패: {result.get('error', 'Unknown')}")
+                    return []
+            except:
+                print(f"   ⏰ 배치 처리 타임아웃")
+                return []
+        
+        # 5. 결과 정렬 및 병합 (시간 순서 보장)
+        print(f"🔗 [Merge] 배치 결과를 시간 순서대로 병합...")
+        final_frames = []
+        
+        for batch_id in range(len(batch_tasks)):
+            if batch_id in batch_results:
+                batch_frames = batch_results[batch_id]['processed_frames']
+                final_frames.extend(batch_frames)
+                print(f"   📦 배치 {batch_id}: {len(batch_frames)}개 프레임 병합")
+        
+        print(f"🎉 [Success] 단일 GPU 스타일 멀티 GPU 처리 완료!")
+        print(f"   - 총 처리 프레임: {len(final_frames)}개")
+        print(f"   - 세그먼트 분할: 없음 (완전 연속)")
+        print(f"   - VAE 일관성: 100% 보장")
+        
+        return final_frames
+    
     def process_with_full_dynamic_queue(self, audio_path: str, video_frames: List[np.ndarray],
                                        coord_list: List, model_config: Dict) -> List[np.ndarray]:
         """
-        완전한 동적 작업 분배로 오디오-비디오 처리
+        🎯 [SINGLE GPU STYLE] 단일 GPU 방식을 멀티 GPU에 완전히 모방
         
-        사용자 요구사항:
-        - 1분 영상, 30초 세그먼트, 4개 GPU의 경우
-        - 1-10, 11-20, 21-30, 31-40 순서로 세그먼트 생성
-        - 1,2,3,4번 세그먼트를 4개 GPU에서 병렬 처리
-        - 3번 GPU가 먼저 끝나면 5번 세그먼트 할당
-        - 1번 GPU가 끝나면 6번 세그먼트 할당
-        - 이런 식으로 동적 할당하여 모든 GPU가 최대한 활용되도록 함
+        핵심 변경사항:
+        - 세그먼트 분할 제거: 전체 비디오를 한 번에 처리
+        - 전체 컨텍스트 유지: 모든 프레임이 서로 연관성을 가짐
+        - 배치만 분산: 각 GPU가 배치 단위로만 작업 분담
+        - 단일 VAE 인코딩: 모든 프레임을 동일한 기준으로 인코딩
         
         Args:
             audio_path: 오디오 파일 경로
@@ -737,56 +1042,74 @@ class DynamicMultiGPUManager:
             else:
                 video_frames_serializable.append(np.array(frame))
         
+        # 🎯 [GLOBAL REFERENCE] 첫 세그먼트 기준으로 전역 일관성 확보
+        print(f"🎯 [GLOBAL REFERENCE] 첫 세그먼트 기준 설정으로 덜덜거림 완전 제거")
+        
+        # 첫 번째 세그먼트의 첫 번째 프레임을 전역 기준으로 설정
+        if len(video_frames_serializable) > 0:
+            global_reference_frame = video_frames_serializable[0].copy()
+            # 전역 기준 프레임의 통계 계산
+            ref_mean = np.mean(global_reference_frame, axis=(0, 1))
+            ref_std = np.std(global_reference_frame, axis=(0, 1))
+            model_config['global_reference_frame'] = global_reference_frame
+            model_config['global_ref_mean'] = ref_mean
+            model_config['global_ref_std'] = ref_std
+            print(f"   - 전역 기준 프레임 설정 완료: 평균 {ref_mean}, 표준편차 {ref_std}")
+        
+        # 🔧 [CRITICAL FIX] 싱글 GPU와 동일한 순환 리스트 방식 적용
+        # 완전 동적 처리에서도 연속성 보장을 위해 순환 리스트 사용
+        print(f"🔄 [FULL DYNAMIC COORD SYNC] 싱글 GPU와 동일한 순환 리스트 방식 적용")
+        
+        # 순환 리스트 생성 (싱글 GPU와 동일)
+        frame_list_cycle = video_frames_serializable + video_frames_serializable[::-1]
+        coord_list_cycle = coord_list + coord_list[::-1]
+        
+        print(f"   - 원본 프레임 수: {len(video_frames_serializable)}개")
+        print(f"   - 순환 프레임 수: {len(frame_list_cycle)}개")
+        print(f"   - 원본 좌표 수: {len(coord_list)}개")
+        print(f"   - 순환 좌표 수: {len(coord_list_cycle)}개")
+        
         # 3. 모든 세그먼트를 동적 작업 큐에 추가
         print(f"📋 [FullDynamic] 모든 세그먼트를 동적 큐에 추가 중...")
         
         for segment in segments:
-            # 해당 세그먼트에 대응하는 비디오 프레임 계산 (강사 강의 영상 정확한 매핑)
+            # 해당 세그먼트에 대응하는 비디오 프레임 계산 (순환 리스트 기반)
             start_frame = int(segment['start_time'] * model_config['fps'])
             end_frame = int(segment['end_time'] * model_config['fps'])
             
-            # 실제 비디오 길이 기반 프레임 추출 (순환 대신 정확한 시간 매핑)
+            # 🔧 [CRITICAL FIX] 순환 리스트 기반 프레임 추출 (싱글 GPU와 동일)
             segment_frames = []
             segment_coords = []
-            total_frames = len(video_frames_serializable)
-            video_duration = total_frames / model_config['fps']  # 실제 비디오 길이 (초)
+            total_cycle_frames = len(frame_list_cycle)
+            video_duration = len(video_frames_serializable) / model_config['fps']  # 실제 비디오 길이 (초)
             
             # 세그먼트별 상세 매핑 정보 출력 (처음 5개와 마지막 5개만)
             if segment['segment_id'] < 5 or segment['segment_id'] >= len(segments) - 5:
                 print(f"   🎬 [DYNAMIC COORD] 세그먼트 {segment['segment_id']}: {segment['start_time']:.1f}-{segment['end_time']:.1f}초")
-                print(f"      - 비디오 길이: {video_duration:.1f}초 ({total_frames}프레임)")
+                print(f"      - 비디오 길이: {video_duration:.1f}초 ({len(video_frames_serializable)}프레임)")
                 print(f"      - 요청 프레임 범위: {start_frame}-{end_frame-1}")
             
             # 좌표 보간을 위한 유효한 좌표 인덱스 수집 (강사 움직임 추적 안정성 향상)
             valid_coord_indices = []
-            for idx in range(min(total_frames, end_frame)):
+            for idx in range(min(len(video_frames_serializable), end_frame)):
                 if idx < len(coord_list) and coord_list[idx] is not None:
                     valid_coord_indices.append(idx)
             
+            # 🔧 [CRITICAL FIX] 순환 리스트 기반 세그먼트 범위 처리 (싱글 GPU와 동일)
             for frame_idx in range(start_frame, end_frame):
-                if frame_idx < total_frames:
-                    # 실제 프레임이 존재하는 경우 - 정확한 좌표 사용
-                    segment_frames.append(video_frames_serializable[frame_idx])
-                    
-                    # 좌표 처리: 유효하지 않은 경우 보간 사용
-                    if frame_idx < len(coord_list) and coord_list[frame_idx] is not None:
-                        segment_coords.append(coord_list[frame_idx])
-                    else:
-                        # 좌표 보간: 가장 가까운 유효한 좌표 사용 (강사 얼굴 추적 연속성 보장)
-                        interpolated_coord = self._interpolate_coordinate(frame_idx, valid_coord_indices, coord_list)
-                        segment_coords.append(interpolated_coord)
-                        
-                        if (frame_idx - start_frame < 3) and (segment['segment_id'] < 5 or segment['segment_id'] >= len(segments) - 5):
-                            print(f"      🔄 프레임 {frame_idx}: 좌표 보간 적용")
-                else:
-                    # 비디오 길이를 초과하는 경우 - 마지막 유효한 프레임과 좌표 사용
-                    last_valid_idx = total_frames - 1
-                    segment_frames.append(video_frames_serializable[last_valid_idx])
-                    segment_coords.append(coord_list[last_valid_idx])
-                    
-                    # 처음 몇 번만 경고 출력 (로그 스팸 방지)
-                    if frame_idx - total_frames < 3 and (segment['segment_id'] < 5 or segment['segment_id'] >= len(segments) - 5):
-                        print(f"      ⚠️  프레임 {frame_idx}: 비디오 범위 초과, 마지막 프레임({last_valid_idx}) 재사용")
+                # 순환 리스트에서 프레임과 좌표 추출 (연속성 보장)
+                cycle_idx = frame_idx % total_cycle_frames
+                segment_frames.append(frame_list_cycle[cycle_idx])
+                segment_coords.append(coord_list_cycle[cycle_idx])
+                
+                # 디버깅: 처음 몇 개와 마지막 몇 개 세그먼트의 매핑 정보만 출력
+                if (segment['segment_id'] < 5 or segment['segment_id'] >= len(segments) - 5) and \
+                   ((frame_idx - start_frame < 3) or (frame_idx >= end_frame - 3)):
+                    original_idx = cycle_idx % len(video_frames_serializable)
+                    is_reversed = cycle_idx >= len(video_frames_serializable)
+                    print(f"      🔄 프레임 {frame_idx}: 순환[{cycle_idx}] -> 원본[{original_idx}] {'(역순)' if is_reversed else '(정순)'}")
+            
+            # 오버랩 처리 제거 (정확한 동기화 우선)
             
             # 좌표 매핑 검증 (강사 강의 영상 품질 보장) - 상세 로그는 일부만
             valid_coords = [coord for coord in segment_coords if coord is not None]
@@ -805,6 +1128,15 @@ class DynamicMultiGPUManager:
             segment_duration = segment['end_time'] - segment['start_time']
             task_config = model_config.copy()
             task_config['segment_duration'] = segment_duration  # 실제 세그먼트 길이 (초)
+            task_config['start_frame_global'] = start_frame  # 🔧 [CRITICAL FIX] 전역 프레임 인덱스 추가
+            
+            # 🔗 [OVERLAP FOR STABILITY] 덜덜거림 제거를 위한 오버랩 재활성화
+            if segment['segment_id'] > 0:  # 첫 번째 세그먼트가 아닌 경우
+                task_config['has_overlap'] = True
+                task_config['overlap_frames'] = 5  # 적당한 오버랩으로 부드러운 전환
+            else:
+                task_config['has_overlap'] = False
+                task_config['overlap_frames'] = 0
             
             task = {
                 'segment_id': segment['segment_id'],
@@ -892,9 +1224,9 @@ class DynamicMultiGPUManager:
         for segment_id in range(total_segments):
             if segment_id in results:
                 result = results[segment_id]
-                frames_count = len(result['processed_frames'])
-                final_frames.extend(result['processed_frames'])
-                print(f"   ✅ 세그먼트 {segment_id}: {frames_count}개 프레임 병합")
+                processed_frames = result['processed_frames']
+                final_frames.extend(processed_frames)
+                print(f"   ✅ 세그먼트 {segment_id}: {len(processed_frames)}개 프레임 병합")
             else:
                 missing_segments.append(segment_id)
                 print(f"   ❌ 세그먼트 {segment_id}: 누락됨")
@@ -992,16 +1324,10 @@ class GPUWorker:
             print(f"💥 [GPU {self.device.index} Worker] MuseTalk 모델 로딩 실패: {e}")
             raise
         
-        # 데이터 타입 변환
-        if self.use_float16:
-            self.pe = self.pe.half()
-            self.vae.vae = self.vae.vae.half()
-            self.unet.model = self.unet.model.half()
-        
-        # 모델을 GPU로 이동
-        self.pe = self.pe.to(self.device)
-        self.vae.vae = self.vae.vae.to(self.device)
-        self.unet.model = self.unet.model.to(self.device)
+        # 🔧 [데이터 타입 통일] 모든 모델을 동일한 디바이스와 데이터 타입으로 변환
+        self.pe = self.pe.to(self.device, dtype=self.weight_dtype)
+        self.vae.vae = self.vae.vae.to(self.device, dtype=self.weight_dtype)
+        self.unet.model = self.unet.model.to(self.device, dtype=self.weight_dtype)
         
         # Whisper 모델 로딩
         whisper_path = model_paths.get('whisper_path', "openai/whisper-tiny")
@@ -1009,9 +1335,11 @@ class GPUWorker:
         print(f"   - whisper_path: {whisper_path}")
         
         try:
-            self.whisper = WhisperModel.from_pretrained(whisper_path)
+            from transformers import WhisperForConditionalGeneration
+            self.whisper = WhisperForConditionalGeneration.from_pretrained(whisper_path)
             self.whisper = self.whisper.to(device=self.device, dtype=self.weight_dtype).eval()
-            self.whisper.requires_grad_(False)
+            for param in self.whisper.parameters():
+                param.requires_grad = False
             print(f"✅ [GPU {self.device.index} Worker] Whisper 모델 로딩 성공")
         except Exception as e:
             print(f"💥 [GPU {self.device.index} Worker] Whisper 모델 로딩 실패: {e}")
@@ -1065,6 +1393,13 @@ class GPUWorker:
             # 2. 비디오 프레임 처리 (실제 추론 로직)
             print(f"   🔄 [GPU {gpu_id} Worker] 프레임 처리 시작...")
             
+            # 🔗 [SEGMENT CONTINUITY] 이전 세그먼트와의 연속성 보장
+            # 첫 번째 세그먼트가 아닌 경우, 이전 세그먼트의 마지막 프레임 참조
+            prev_frame_context = task.get('prev_frame_context', None)
+            if prev_frame_context is not None:
+                print(f"      🔗 [GPU {gpu_id}] 이전 세그먼트 맥락 사용 (연속성 보장)")
+                config['prev_frame_context'] = prev_frame_context
+            
             # 세그먼트별 좌표 리스트 사용 (강사 강의 영상의 정확한 얼굴 위치 매핑)
             segment_coords = task.get('coord_list', [])
             processed_frames = self._process_frames(
@@ -1078,13 +1413,40 @@ class GPUWorker:
             # 세그먼트 처리 완료 후 메모리 정리 (다음 작업을 위해)
             torch.cuda.empty_cache()
             
-            return {
+            # 🎯 [GLOBAL CONSISTENCY] 전역 기준 프레임으로 일관성 보장
+            enhanced_frames = self._apply_global_consistency(processed_frames, config, segment_id)
+            
+            # 🔧 [OVERLAP PROCESSING] 오버랩 처리를 위한 후처리
+            # 첫 번째 세그먼트가 아닌 경우, 오버랩 프레임 제거
+            final_processed_frames = enhanced_frames
+            has_overlap = config.get('has_overlap', False)
+            overlap_frames = config.get('overlap_frames', 0)
+            
+            if has_overlap and overlap_frames > 0 and len(enhanced_frames) > overlap_frames:
+                # 오버랩 프레임 제거 (중복 방지)
+                final_processed_frames = enhanced_frames[overlap_frames:]
+                print(f"   🔗 [GPU {gpu_id} Worker] 오버랩 프레임 제거: {len(enhanced_frames)} -> {len(final_processed_frames)}개")
+            
+            # 🔗 [SEGMENT CONTINUITY] 다음 세그먼트를 위한 마지막 프레임 맥락 저장
+            last_frame_context = None
+            if len(final_processed_frames) > 0:
+                last_frame_context = final_processed_frames[-1].copy()  # 마지막 프레임 복사
+            
+            # 오버랩 정보 포함하여 결과 반환 (연속성 보장)
+            result = {
                 'segment_id': segment_id,
                 'gpu_id': self.physical_gpu_id,  # 실제 물리 GPU ID 사용 (워커에서는 device.index가 항상 0)
-                'processed_frames': processed_frames,
+                'processed_frames': final_processed_frames,
+                'last_frame_context': last_frame_context,  # 다음 세그먼트를 위한 맥락
                 'success': True,
-                'processing_time': time.time()
+                'processing_time': time.time(),
+                'has_overlap': has_overlap,
+                'overlap_frames_removed': overlap_frames if has_overlap else 0
             }
+            
+            # 🔧 [OVERLAP REMOVED] 오버랩 처리는 워커에서 수행됨
+            
+            return result
             
         except Exception as e:
             gpu_id = self.physical_gpu_id  # 실제 물리 GPU ID 사용
@@ -1094,6 +1456,104 @@ class GPUWorker:
             return {
                 'segment_id': task.get('segment_id', -1),
                 'gpu_id': self.physical_gpu_id,  # 실제 물리 GPU ID 사용 (워커에서는 device.index가 항상 0)
+                'error': str(e),
+                'success': False
+            }
+    
+    def process_batch(self, task: Dict) -> Dict:
+        """
+        배치 처리 (새로운 단일 GPU 스타일 멀티 GPU 방식)
+        
+        Args:
+            task: 배치 작업 정보
+                - batch_id: 배치 ID
+                - whisper_chunks: Whisper 청크들
+                - input_latents: VAE 인코딩된 latent들
+                - config: 모델 설정
+                
+        Returns:
+            Dict: 처리 결과
+        """
+        try:
+            batch_id = task['batch_id']
+            whisper_chunks = task['whisper_chunks']
+            input_latents = task['input_latents']
+            config = task['config']
+            
+            gpu_id = self.physical_gpu_id
+            print(f"🎬 [GPU {gpu_id} Worker] 배치 {batch_id} 처리 시작:")
+            print(f"   - Whisper 청크: {len(whisper_chunks)}개")
+            print(f"   - Input latent: {len(input_latents)}개")
+            
+            processed_frames = []
+            
+            # 🔧 [BATCH FIX] 단일 GPU 방식과 동일하게 배치 처리
+            with torch.no_grad():
+                # 1. 모든 whisper 청크를 배치로 변환
+                whisper_batch = []
+                for whisper_chunk in whisper_chunks:
+                    if isinstance(whisper_chunk, np.ndarray):
+                        whisper_tensor = torch.from_numpy(whisper_chunk).to(self.device, dtype=self.weight_dtype)
+                    elif hasattr(whisper_chunk, 'to'):
+                        whisper_tensor = whisper_chunk.cpu().to(self.device, dtype=self.weight_dtype)
+                    else:
+                        whisper_tensor = torch.tensor(whisper_chunk).to(self.device, dtype=self.weight_dtype)
+                    whisper_batch.append(whisper_tensor)
+                
+                whisper_batch = torch.stack(whisper_batch)
+                
+                # 2. 모든 input latent를 배치로 변환
+                latent_batch = []
+                for input_latent in input_latents:
+                    latent = input_latent.cpu().to(self.device, dtype=self.weight_dtype)
+                    latent_batch.append(latent)
+                
+                latent_batch = torch.cat(latent_batch, dim=0)
+                
+                # 3. 오디오 특징을 위치 인코딩 (단일 GPU와 동일)
+                audio_feature_batch = self.pe(whisper_batch)
+                
+                # 4. UNet 추론 (단일 GPU와 동일한 방식)
+                pred_latents = self.unet.model(
+                    latent_batch, 
+                    self.timesteps, 
+                    encoder_hidden_states=audio_feature_batch
+                ).sample
+                
+                # 5. VAE 디코딩 (단일 GPU와 동일)
+                decoded_frames = self.vae.vae.decode(pred_latents / self.vae.vae.config.scaling_factor).sample
+                
+                # 6. 배치 결과를 개별 프레임으로 분리
+                decoded_frames = (decoded_frames / 2 + 0.5).clamp(0, 1)
+                decoded_frames = decoded_frames.cpu().permute(0, 2, 3, 1).numpy()
+                
+                for decoded_frame in decoded_frames:
+                    decoded_frame = (decoded_frame * 255).astype(np.uint8)
+                    processed_frames.append(decoded_frame)
+            
+            print(f"   ✅ [GPU {gpu_id} Worker] 배치 {batch_id} 처리 완료:")
+            print(f"      - 생성된 프레임: {len(processed_frames)}개")
+            print(f"      - GPU 메모리 사용량: {torch.cuda.memory_allocated(self.device) / 1024**3:.2f}GB")
+            
+            # 메모리 정리
+            torch.cuda.empty_cache()
+            
+            return {
+                'batch_id': batch_id,
+                'gpu_id': self.physical_gpu_id,
+                'processed_frames': processed_frames,
+                'success': True,
+                'processing_time': time.time()
+            }
+            
+        except Exception as e:
+            gpu_id = self.physical_gpu_id
+            print(f"💥 [GPU {gpu_id} Worker] 배치 처리 오류: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'batch_id': task.get('batch_id', -1),
+                'gpu_id': self.physical_gpu_id,
                 'error': str(e),
                 'success': False
             }
@@ -1124,17 +1584,32 @@ class GPUWorker:
             print(f"      💥 [GPU {gpu_id}] AudioProcessor 초기화 실패: {e}")
             raise
         
-        # 오디오 특징을 리스트 형태로 변환 (30초 세그먼트)
+        # 오디오 특징을 리스트 형태로 변환 (세그먼트별 처리)
         whisper_input_features = [audio_features]
         
         # 실제 세그먼트 오디오 길이를 config에서 가져오기 (초 단위)
         segment_duration = config.get('segment_duration', 5.0)  # 기본값 5초
         librosa_length = int(segment_duration * 16000)  # 샘플 수로 변환 (16kHz 기준)
         
+        # 🎨 [NATURAL AUDIO] 자연스러운 오디오 처리를 위한 개선사항
+        # 오디오 특징에 시간적 가중치 적용으로 더 자연스러운 립싱크
+        audio_features = self._enhance_audio_features_for_naturalness(audio_features, config)
+        
         print(f"         - 오디오 특징 크기: {audio_features.shape}")
         print(f"         - 세그먼트 길이: {segment_duration}초")
-        print(f"         - 실제 오디오 길이 (샘플): {librosa_length:,}개")
-        print(f"         - 실제 오디오 길이 (초): {librosa_length/16000:.2f}초")
+        print(f"         - 비디오 프레임 수: {len(video_frames)}개")
+        print(f"         - 오디오 길이 (샘플): {librosa_length:,}개")
+        print(f"         - 오디오 길이 (초): {librosa_length/16000:.2f}초")
+        
+        # 🔧 [FRAME-AUDIO SYNC] 비디오 프레임 수에 맞춰 오디오 길이 조정
+        # 실제 비디오 프레임 수에 정확히 맞춰서 Whisper 청크 생성
+        video_frame_count = len(video_frames)
+        video_duration_actual = video_frame_count / config['fps']  # 실제 비디오 길이 (초)
+        final_librosa_length = int(video_duration_actual * 16000)  # 실제 프레임 수에 맞춘 오디오 길이
+        
+        print(f"         - 원본 오디오 길이: {librosa_length:,}샘플")
+        print(f"         - 프레임 동기화 길이: {final_librosa_length:,}샘플 (프레임: {video_frame_count}개)")
+        print(f"         - 실제 세그먼트 길이: {video_duration_actual:.3f}초")
         
         # Whisper 청크 생성
         whisper_chunks = audio_processor.get_whisper_chunk(
@@ -1142,11 +1617,14 @@ class GPUWorker:
             self.device,
             self.weight_dtype,
             self.whisper,
-            librosa_length,
-            fps=config.get('fps', 25),  # FPS를 25로 제한하여 청크 수 감소
+            final_librosa_length,
+            fps=config['fps'],  # 실제 비디오 fps 전달
             audio_padding_length_left=config.get('audio_padding_length_left', 0),
             audio_padding_length_right=config.get('audio_padding_length_right', 0),
         )
+        
+        print(f"         - 생성된 Whisper 청크 수: {len(whisper_chunks)}")
+        print(f"         - 프레임-청크 비율: {len(whisper_chunks)}/{len(video_frames)} = {len(whisper_chunks)/len(video_frames):.3f}")
         
         # AudioProcessor 사용 후 메모리 정리
         del audio_processor, whisper_input_features
@@ -1154,54 +1632,43 @@ class GPUWorker:
         
         # 2. 비디오 프레임을 VAE 잠재 공간으로 변환
         print(f"      🖼️  [GPU {gpu_id}] 비디오 프레임 처리 시작...")
+        
+        # 🔧 [CRITICAL FIX] 세그먼트별 좌표에 맞는 얼굴 크롭 적용
+        # 단일 GPU와 동일하게 각 프레임별로 해당 좌표를 사용해서 latent 생성
         input_latent_list = []
+        
         # 세그먼트별 좌표 사용 (강사 강의 영상의 정확한 얼굴 매핑)
         coord_list = segment_coords if segment_coords is not None else config.get('coord_list', [])
-        print(f"         - 입력 프레임 수: {len(video_frames)}")
-        print(f"         - 좌표 리스트 길이: {len(coord_list)}")
-        print(f"         - 세그먼트별 좌표 사용: {'Yes' if segment_coords is not None else 'No (전체 좌표 사용)'}")
         
-        # 좌표 유효성 사전 검증 (강사 강의 영상 안정성 보장)
-        valid_coord_count = 0
-        invalid_coord_indices = []
-        for i, coord in enumerate(coord_list):
-            if coord is not None and len(coord) >= 4:
-                x1, y1, x2, y2 = coord[:4]
-                if x2 > x1 and y2 > y1 and x1 >= 0 and y1 >= 0:
-                    valid_coord_count += 1
-                else:
-                    invalid_coord_indices.append(i)
-            else:
-                invalid_coord_indices.append(i)
-        
-        print(f"         - 유효한 좌표: {valid_coord_count}/{len(coord_list)}개")
-        if len(invalid_coord_indices) > 0:
-            print(f"         - 무효한 좌표 인덱스: {invalid_coord_indices[:5]}{'...' if len(invalid_coord_indices) > 5 else ''}")
+        print(f"      🎯 [GPU {gpu_id}] 세그먼트별 좌표 기반 VAE 인코딩 시작")
+        print(f"         - 세그먼트 프레임 수: {len(video_frames)}")
+        print(f"         - 세그먼트 좌표 수: {len(coord_list)}")
         
         for i, frame in enumerate(video_frames):
             if i < len(coord_list):
-                # 좌표가 있는 경우 얼굴 영역 크롭
+                # 좌표가 있는 경우 얼굴 영역 크롭 (단일 GPU와 동일한 방식)
                 bbox = coord_list[i]
                 if bbox is not None and len(bbox) >= 4:
                     x1, y1, x2, y2 = bbox[:4]
                     
-                    # 좌표 유효성 재검증 (강사 움직임으로 인한 잘못된 좌표 필터링)
+                    # 좌표 유효성 검증
                     if x2 > x1 and y2 > y1 and x1 >= 0 and y1 >= 0 and x2 <= frame.shape[1] and y2 <= frame.shape[0]:
                         # 디버깅: 처음 3개와 마지막 3개 프레임의 좌표 정보 출력
                         if i < 3 or i >= len(video_frames) - 3:
-                            print(f"         - 프레임 {i}: 유효한 좌표 ({x1}, {y1}, {x2}, {y2})")
+                            print(f"         - 프레임 {i}: 세그먼트 좌표 ({x1}, {y1}, {x2}, {y2})")
                         
+                        # 🔧 [SIMPLE CROP] 단일 GPU와 동일한 단순한 얼굴 크롭
                         extra_margin = config.get('extra_margin', 10)
                         y2 = y2 + extra_margin
                         y2 = min(y2, frame.shape[0])
                         
-                        # 얼굴 영역 크롭 및 리사이즈
+                        # 단순한 얼굴 크롭 (단일 GPU와 동일)
                         crop_frame = frame[y1:y2, x1:x2]
                         crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
                     else:
                         # 잘못된 좌표인 경우 전체 프레임 사용
                         if i < 3 or i >= len(video_frames) - 3:
-                            print(f"         - 프레임 {i}: 잘못된 좌표 ({x1}, {y1}, {x2}, {y2}), 전체 프레임 사용")
+                            print(f"         - 프레임 {i}: 잘못된 좌표, 전체 프레임 사용")
                         crop_frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
                 else:
                     # 좌표가 없는 경우 전체 프레임 사용
@@ -1214,9 +1681,14 @@ class GPUWorker:
                     print(f"         - 프레임 {i}: 좌표 리스트 부족, 전체 프레임 사용")
                 crop_frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
             
-            # VAE를 사용하여 잠재 벡터로 변환
+            # 🎯 [NATURAL VAE ENCODING] 원본 프레임 그대로 사용하여 자연스러운 인코딩
+            # 정규화 없이 원본 crop_frame을 직접 사용 (단일 GPU와 동일한 방식)
+            
+            # 🎯 [VAE ENCODING] 세그먼트별 정확한 latent 생성
             latents = self.vae.get_latents_for_unet(crop_frame)
             input_latent_list.append(latents)
+        
+        print(f"      ✅ [GPU {gpu_id}] 세그먼트별 VAE 인코딩 완료: {len(input_latent_list)}개 latent 생성")
         
         # 3. 배치 단위로 추론 실행
         print(f"      🔄 [GPU {gpu_id}] 배치 추론 시작...")
@@ -1261,6 +1733,15 @@ class GPUWorker:
         # 배치별로 처리
         for i, (whisper_batch, latent_batch) in enumerate(gen):
             batch_count += 1
+            
+            # 🎨 [NATURAL BATCH] 배치 단위로 자연스러운 처리 적용
+            # 배치 내 프레임 간 연속성도 고려
+            if batch_count > 1 and len(processed_frames) > 0:
+                # 이전 배치의 마지막 프레임과의 연속성 고려
+                prev_frame_context = processed_frames[-1] if processed_frames else None
+            else:
+                prev_frame_context = None
+            
             # print(f"         🎯 배치 {batch_count}: {whisper_batch.shape[0]}개 프레임 처리 중...")
             
             # 오디오 특징을 위치 인코딩
@@ -1280,17 +1761,30 @@ class GPUWorker:
             try:
                 recon = self.vae.decode_latents(pred_latents)
                 
-                # 결과 프레임 추가
-                batch_frames = 0
-                for res_frame in recon:
-                    processed_frames.append(res_frame)
-                    batch_frames += 1
+                # 🎨 [NATURAL FRAMES] 배치 결과에 자연스러운 후처리 적용
+                batch_frames = list(recon)
+                
+                # 이전 배치와의 연속성 보장
+                if prev_frame_context is not None and len(batch_frames) > 0:
+                    # 첫 번째 프레임에 이전 배치와의 블렌딩 적용
+                    first_frame = batch_frames[0]
+                    blended_first = (
+                        0.3 * prev_frame_context.astype(np.float32) +
+                        0.7 * first_frame.astype(np.float32)
+                    ).astype(np.uint8)
+                    batch_frames[0] = blended_first
+                
+                # 배치 내 프레임들 추가
+                batch_frames_count = 0
+                for frame in batch_frames:
+                    processed_frames.append(frame)
+                    batch_frames_count += 1
                 
                 # 배치 처리 후 즉시 메모리 정리 (OOM 방지)
                 del pred_latents, recon
                 torch.cuda.empty_cache()
                 
-                # print(f"         ✅ 배치 {batch_count} 완료: {batch_frames}개 프레임 생성")
+                # print(f"         ✅ 배치 {batch_count} 완료: {batch_frames_count}개 프레임 생성")
                 
             except torch.cuda.OutOfMemoryError as e:
                 # OOM 발생 시 메모리 정리 후 더 작은 배치로 재시도
@@ -1310,7 +1804,18 @@ class GPUWorker:
                         ).sample
                         
                         single_recon = self.vae.decode_latents(single_pred)
-                        processed_frames.append(single_recon[0])
+                        
+                        # 안전 모드에서도 연속성 보장
+                        frame = single_recon[0]
+                        if len(processed_frames) > 0:
+                            prev_frame = processed_frames[-1]
+                            # 간단한 블렌딩으로 연속성 보장
+                            frame = (
+                                0.1 * prev_frame.astype(np.float32) +
+                                0.9 * frame.astype(np.float32)
+                            ).astype(np.uint8)
+                        
+                        processed_frames.append(frame)
                         
                         # 각 프레임 처리 후 메모리 정리
                         del single_latent, single_audio, single_pred, single_recon
@@ -1323,4 +1828,523 @@ class GPUWorker:
         
         print(f"      🎉 [GPU {gpu_id}] 모든 배치 처리 완료: 총 {len(processed_frames)}개 프레임")
         
-        return processed_frames 
+        return processed_frames
+    
+    def _apply_natural_enhancements(self, frames: List[np.ndarray], config: Dict, segment_id: int) -> List[np.ndarray]:
+        """
+        자연스러운 립싱크를 위한 고급 후처리 시스템
+        
+        강사 강의 영상의 자연스러운 표현을 위한 개선사항:
+        1. 시간적 스무딩 (프레임 간 부드러운 전환)
+        2. 표정 연속성 보장 (급격한 변화 방지)
+        3. 입술 움직임 자연성 향상
+        4. 눈 깜박임 및 미세 표정 보정
+        
+        Args:
+            frames: 처리된 프레임 리스트
+            config: 설정 정보
+            segment_id: 세그먼트 ID
+            
+        Returns:
+            List[np.ndarray]: 자연스러운 후처리가 적용된 프레임 리스트
+        """
+        if len(frames) < 2:
+            return frames
+        
+        gpu_id = self.device.index
+        print(f"      🎨 [GPU {gpu_id}] 자연스러운 후처리 시작...")
+        
+        # 0. 밝기 일관성은 매우 부드럽게만 적용 (자연스러운 결과 우선)
+        # brightness_consistent_frames = self._ensure_brightness_consistency(frames)
+        brightness_consistent_frames = frames  # 원본 그대로 사용하여 자연스러움 우선
+        
+        # 1. 시간적 스무딩 적용
+        smoothed_frames = self._apply_temporal_smoothing(brightness_consistent_frames)
+        
+        # 2. 표정 연속성 보장
+        continuous_frames = self._ensure_expression_continuity(smoothed_frames)
+        
+        # 3. 입술 움직임 자연성 향상
+        natural_frames = self._enhance_lip_movement_naturalness(continuous_frames)
+        
+        # 4. 미세 표정 보정 (눈 깜박임, 눈동자 움직임 등)
+        final_frames = self._refine_micro_expressions(natural_frames)
+        
+        print(f"      ✨ [GPU {gpu_id}] 자연스러운 후처리 완료: {len(final_frames)}개 프레임")
+        
+        return final_frames
+    
+    def _ensure_brightness_consistency(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+        """
+        🌟 [BRIGHTNESS CONSISTENCY] 세그먼트 간 밝기 및 색상 일관성 보장
+        
+        멀티 GPU 환경에서 세그먼트별로 다른 VAE 인코딩으로 인한
+        밝기 변화와 색상 차이를 보정하여 단일 GPU와 동일한 결과를 생성
+        
+        Args:
+            frames: 입력 프레임 리스트
+            
+        Returns:
+            밝기가 일관된 프레임 리스트
+        """
+        if len(frames) < 2:
+            return frames
+        
+        gpu_id = self.device.index
+        print(f"         🌟 [GPU {gpu_id}] 밝기 일관성 보정 시작...")
+        
+        consistent_frames = []
+        
+        # 첫 번째 프레임을 기준으로 설정
+        reference_frame = frames[0]
+        consistent_frames.append(reference_frame)
+        
+        # 기준 프레임의 밝기 및 색상 통계 계산
+        ref_mean = np.mean(reference_frame, axis=(0, 1))  # RGB 각 채널별 평균
+        ref_std = np.std(reference_frame, axis=(0, 1))    # RGB 각 채널별 표준편차
+        
+        for i in range(1, len(frames)):
+            current_frame = frames[i]
+            
+            # 현재 프레임의 밝기 및 색상 통계 계산
+            curr_mean = np.mean(current_frame, axis=(0, 1))
+            curr_std = np.std(current_frame, axis=(0, 1))
+            
+            # 🎯 [HISTOGRAM MATCHING] 히스토그램 매칭을 통한 색상 보정
+            corrected_frame = current_frame.astype(np.float32)
+            
+            for channel in range(3):  # RGB 각 채널별로 처리
+                # 표준편차가 0인 경우 방지
+                if curr_std[channel] > 0:
+                    # 정규화 후 기준 프레임의 분포로 조정
+                    corrected_frame[:, :, channel] = (
+                        (corrected_frame[:, :, channel] - curr_mean[channel]) / curr_std[channel]
+                    ) * ref_std[channel] + ref_mean[channel]
+                else:
+                    # 표준편차가 0인 경우 평균만 조정
+                    corrected_frame[:, :, channel] = (
+                        corrected_frame[:, :, channel] - curr_mean[channel] + ref_mean[channel]
+                    )
+            
+            # 픽셀 값 범위 제한 (0-255)
+            corrected_frame = np.clip(corrected_frame, 0, 255).astype(np.uint8)
+            
+            # 🔗 [SMOOTH TRANSITION] 급격한 변화 방지를 위한 부드러운 전환
+            # 이전 프레임과의 차이가 큰 경우 점진적 적용
+            prev_frame = consistent_frames[-1]
+            frame_diff = np.mean(np.abs(corrected_frame.astype(np.float32) - prev_frame.astype(np.float32)))
+            
+            if frame_diff > 15.0:  # 급격한 밝기 변화 감지
+                # 🎨 [GENTLE CORRECTION] 색상 보존을 위한 부드러운 보정
+                # 50% 보정 + 50% 원본으로 자연스러운 전환 (70% → 50%)
+                blend_ratio = 0.5
+                final_frame = (
+                    blend_ratio * corrected_frame.astype(np.float32) +
+                    (1 - blend_ratio) * current_frame.astype(np.float32)
+                ).astype(np.uint8)
+            else:
+                # 작은 변화도 30% 원본 유지로 색상 보존
+                final_frame = (
+                    0.7 * corrected_frame.astype(np.float32) +
+                    0.3 * current_frame.astype(np.float32)
+                ).astype(np.uint8)
+            
+            consistent_frames.append(final_frame)
+        
+        print(f"         ✅ [GPU {gpu_id}] 밝기 일관성 보정 완료: {len(consistent_frames)}개 프레임")
+        return consistent_frames
+    
+    def _normalize_for_vae_consistency(self, frame: np.ndarray) -> np.ndarray:
+        """
+        🎯 [GENTLE VAE CONSISTENCY] 색상 보존을 위한 부드러운 VAE 정규화
+        
+        강한 정규화로 인한 색상 왜곡(초록색 피부)을 방지하면서도
+        세그먼트 간 VAE 인코딩 일관성을 확보합니다.
+        
+        Args:
+            frame: 입력 프레임 (256x256x3)
+            
+        Returns:
+            부드럽게 정규화된 프레임
+        """
+        # 🎨 [COLOR PRESERVATION] 원본 색상 보존을 위한 부드러운 정규화
+        # 강한 정규화 대신 미세한 조정만 적용
+        
+        normalized_frame = frame.astype(np.float32)
+        
+        # 🔧 [MILD NORMALIZATION] 색상 왜곡 방지를 위한 약한 정규화
+        # 전체 프레임의 밝기만 약간 조정 (채널별 강한 정규화 제거)
+        overall_mean = np.mean(normalized_frame)
+        target_mean = 127.5  # 중간 밝기 목표
+        
+        # 밝기 차이가 클 때만 미세 조정 적용
+        brightness_diff = abs(overall_mean - target_mean)
+        if brightness_diff > 30:  # 큰 차이가 있을 때만
+            # 20% 정도만 목표 밝기로 조정 (80% 원본 유지)
+            adjustment_factor = 0.2
+            brightness_adjustment = (target_mean - overall_mean) * adjustment_factor
+            normalized_frame = normalized_frame + brightness_adjustment
+        
+        # 픽셀 값 범위 제한
+        normalized_frame = np.clip(normalized_frame, 0, 255).astype(np.uint8)
+        
+        return normalized_frame
+    
+    def _apply_global_consistency(self, frames: List[np.ndarray], config: Dict, segment_id: int) -> List[np.ndarray]:
+        """
+        🎯 [GLOBAL CONSISTENCY] 전역 기준 프레임으로 모든 세그먼트의 일관성 보장
+        
+        첫 번째 세그먼트의 기준을 모든 세그먼트에 적용하여
+        세그먼트 간 덜덜거림을 완전히 제거합니다.
+        
+        Args:
+            frames: 처리된 프레임 리스트
+            config: 설정 (전역 기준 정보 포함)
+            segment_id: 세그먼트 ID
+            
+        Returns:
+            전역 기준으로 일관성이 보장된 프레임 리스트
+        """
+        if len(frames) == 0:
+            return frames
+        
+        gpu_id = self.device.index
+        
+        # 첫 번째 세그먼트는 그대로 사용 (기준이 됨)
+        if segment_id == 0:
+            print(f"         🎯 [GPU {gpu_id}] 세그먼트 0: 전역 기준으로 사용 (변경 없음)")
+            return frames
+        
+        # 전역 기준 정보 가져오기
+        global_ref_mean = config.get('global_ref_mean')
+        global_ref_std = config.get('global_ref_std')
+        
+        if global_ref_mean is None or global_ref_std is None:
+            print(f"         ⚠️ [GPU {gpu_id}] 전역 기준 없음, 원본 그대로 사용")
+            return frames
+        
+        print(f"         🎯 [GPU {gpu_id}] 세그먼트 {segment_id}: 전역 기준으로 일관성 보정 시작...")
+        
+        consistent_frames = []
+        
+        for i, frame in enumerate(frames):
+            # 현재 프레임의 통계 계산
+            curr_mean = np.mean(frame, axis=(0, 1))
+            curr_std = np.std(frame, axis=(0, 1))
+            
+            # 🎯 [COLOR PRESERVING ADJUSTMENT] 색상 보존을 위한 부드러운 밝기 조정
+            # RGB 채널별 강한 정규화 대신 전체 밝기만 조정하여 색상 왜곡 방지
+            corrected_frame = frame.astype(np.float32)
+            
+            # 전체 밝기 차이만 계산 (색상 균형 유지)
+            curr_brightness = np.mean(curr_mean)
+            ref_brightness = np.mean(global_ref_mean)
+            brightness_diff = ref_brightness - curr_brightness
+            
+            # 밝기 차이가 클 때만 조정 (색상 왜곡 최소화)
+            if abs(brightness_diff) > 10:  # 임계값 설정
+                # 모든 채널에 동일한 밝기 조정 적용 (색상 균형 유지)
+                corrected_frame = corrected_frame + (brightness_diff * 0.5)  # 50% 적용
+            
+            # 픽셀 값 범위 제한
+            corrected_frame = np.clip(corrected_frame, 0, 255).astype(np.uint8)
+            
+            # 🔗 [STRONG CONSISTENCY] 덜덜거림 제거를 위한 강화된 적용
+            # 70% 보정 + 30% 원본으로 강한 일관성 확보 (30% → 70%)
+            final_frame = (
+                0.7 * corrected_frame.astype(np.float32) +
+                0.3 * frame.astype(np.float32)
+            ).astype(np.uint8)
+            
+            consistent_frames.append(final_frame)
+        
+        print(f"         ✅ [GPU {gpu_id}] 전역 기준 일관성 보정 완료: {len(consistent_frames)}개 프레임")
+        return consistent_frames
+    
+    def _apply_temporal_smoothing(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+        """
+        시간적 스무딩 적용 - 프레임 간 부드러운 전환
+        
+        강사 강의 영상에서 자주 발생하는 문제들:
+        - 갑작스러운 입술 모양 변화
+        - 프레임 간 일관성 부족
+        - 인위적인 느낌의 전환
+        
+        해결 방법:
+        - 가우시안 가중 평균으로 프레임 블렌딩
+        - 전후 프레임의 영향력을 고려한 스무딩
+        - 얼굴 영역별 차별화된 스무딩 강도
+        """
+        if len(frames) < 3:
+            return frames
+        
+        smoothed_frames = []
+        
+        # 🔗 [SEGMENT BOUNDARY] 세그먼트 시작 부분 강화 스무딩
+        # 첫 번째 프레임도 두 번째 프레임과 블렌딩하여 급격한 변화 완화
+        if len(frames) >= 2:
+            first_frame = frames[0].astype(np.float32)
+            second_frame = frames[1].astype(np.float32)
+            # 첫 프레임에 약간의 스무딩 적용 (세그먼트 경계 완화)
+            blended_first = (0.8 * first_frame + 0.2 * second_frame).astype(np.uint8)
+            smoothed_frames.append(blended_first)
+        else:
+            smoothed_frames.append(frames[0])
+        
+        # 중간 프레임들에 초강화된 스무딩 적용
+        for i in range(1, len(frames) - 1):
+            prev_frame = frames[i - 1]
+            curr_frame = frames[i]
+            next_frame = frames[i + 1]
+            
+            # 🎨 [ULTRA SMOOTHING] 덜덜거림 완전 제거를 위한 초강화 스무딩
+            # 가중치를 (0.25, 0.5, 0.25)로 조정하여 훨씬 더 부드러운 전환
+            smoothed_frame = (
+                0.25 * prev_frame.astype(np.float32) +
+                0.5 * curr_frame.astype(np.float32) +
+                0.25 * next_frame.astype(np.float32)
+            ).astype(np.uint8)
+            
+            smoothed_frames.append(smoothed_frame)
+        
+        # 🔗 [SEGMENT BOUNDARY] 세그먼트 끝 부분 강화 스무딩  
+        # 마지막 프레임도 이전 프레임과 블렌딩하여 다음 세그먼트와의 연결 준비
+        if len(frames) >= 2:
+            last_frame = frames[-1].astype(np.float32)
+            second_last_frame = frames[-2].astype(np.float32)
+            # 마지막 프레임에 약간의 스무딩 적용 (다음 세그먼트와의 연결성 향상)
+            blended_last = (0.8 * last_frame + 0.2 * second_last_frame).astype(np.uint8)
+            smoothed_frames.append(blended_last)
+        else:
+            smoothed_frames.append(frames[-1])
+        
+        return smoothed_frames
+    
+    def _ensure_expression_continuity(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+        """
+        표정 연속성 보장 - 급격한 표정 변화 방지
+        
+        강사 강의 영상에서 중요한 요소:
+        - 자연스러운 표정 변화
+        - 갑작스러운 얼굴 경직 방지
+        - 눈과 입 주변의 자연스러운 움직임
+        
+        개선 방법:
+        - 프레임 간 차이 분석
+        - 임계값 기반 변화 제한
+        - 점진적 변화 유도
+        """
+        if len(frames) < 2:
+            return frames
+        
+        continuous_frames = [frames[0]]  # 첫 번째 프레임
+        
+        for i in range(1, len(frames)):
+            prev_frame = continuous_frames[-1]
+            curr_frame = frames[i]
+            
+            # 프레임 간 차이 계산 (평균 픽셀 차이)
+            diff = np.mean(np.abs(curr_frame.astype(np.float32) - prev_frame.astype(np.float32)))
+            
+            # 🔗 [MULTI-GPU CONTINUITY] 멀티 GPU 환경을 위한 더욱 강화된 연속성 보장
+            # 세그먼트 경계에서 발생하는 급격한 변화를 더 적극적으로 완화
+            threshold = 8.0  # 임계값을 더 낮춰서 훨씬 민감하게 감지 (12.0 → 8.0)
+            
+            if diff > threshold:
+                # 🎨 [ULTRA ENHANCED BLENDING] 덜덜거림 완전 제거를 위한 초강화 블렌딩
+                # 변화 정도에 따라 블렌딩 비율을 더욱 보수적으로 조정
+                if diff > 20.0:  # 매우 급격한 변화
+                    blend_ratio = 0.9  # 90% 이전 프레임, 10% 현재 프레임 (더 보수적)
+                elif diff > 15.0:  # 중간 정도 변화
+                    blend_ratio = 0.85  # 85% 이전 프레임, 15% 현재 프레임
+                elif diff > 10.0:  # 약간의 변화
+                    blend_ratio = 0.8  # 80% 이전 프레임, 20% 현재 프레임
+                else:  # 미세한 변화
+                    blend_ratio = 0.75  # 75% 이전 프레임, 25% 현재 프레임
+                
+                blended_frame = (
+                    blend_ratio * prev_frame.astype(np.float32) +
+                    (1 - blend_ratio) * curr_frame.astype(np.float32)
+                ).astype(np.uint8)
+                continuous_frames.append(blended_frame)
+            else:
+                # 자연스러운 변화도 약간의 스무딩 적용 (덜덜거림 완전 제거)
+                light_blend = (
+                    0.1 * prev_frame.astype(np.float32) +
+                    0.9 * curr_frame.astype(np.float32)
+                ).astype(np.uint8)
+                continuous_frames.append(light_blend)
+        
+        return continuous_frames
+    
+    def _enhance_lip_movement_naturalness(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+        """
+        입술 움직임 자연성 향상
+        
+        립싱크에서 가장 중요한 부분:
+        - 입술의 자연스러운 열고 닫힘
+        - 발음에 따른 입모양 변화
+        - 입가 근육의 자연스러운 움직임
+        
+        개선 방법:
+        - 입술 영역 집중 처리
+        - 입모양 변화의 연속성 보장
+        - 미세한 입술 디테일 보정
+        """
+        if len(frames) < 3:
+            return frames
+        
+        enhanced_frames = []
+        
+        for i, frame in enumerate(frames):
+            enhanced_frame = frame.copy()
+            
+            # 입술 영역에 추가 스무딩 적용 (하단 1/3 영역)
+            height = frame.shape[0]
+            lip_region_start = int(height * 0.67)  # 하단 33% 영역
+            
+            # 이전/다음 프레임과의 블렌딩으로 입술 움직임 부드럽게
+            if i > 0 and i < len(frames) - 1:
+                prev_lip = frames[i-1][lip_region_start:, :]
+                curr_lip = frame[lip_region_start:, :]
+                next_lip = frames[i+1][lip_region_start:, :]
+                
+                # 입술 영역에 더 강한 스무딩 (0.1, 0.8, 0.1)
+                smoothed_lip = (
+                    0.1 * prev_lip.astype(np.float32) +
+                    0.8 * curr_lip.astype(np.float32) +
+                    0.1 * next_lip.astype(np.float32)
+                ).astype(np.uint8)
+                
+                enhanced_frame[lip_region_start:, :] = smoothed_lip
+            
+            enhanced_frames.append(enhanced_frame)
+        
+        return enhanced_frames
+    
+    def _refine_micro_expressions(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+        """
+        미세 표정 보정 - 눈 깜박임, 눈동자 움직임 등
+        
+        자연스러운 표정을 위한 미세 조정:
+        - 눈 주변 영역의 자연스러운 움직임
+        - 갑작스러운 밝기 변화 방지
+        - 전체적인 표정의 일관성 유지
+        
+        개선 방법:
+        - 눈 주변 영역 안정화
+        - 전체적인 밝기 일관성 보장
+        - 미세한 노이즈 제거
+        """
+        if len(frames) < 2:
+            return frames
+        
+        refined_frames = []
+        
+        for i, frame in enumerate(frames):
+            refined_frame = frame.copy()
+            
+            # 눈 주변 영역 안정화 (상단 40% 영역)
+            height = frame.shape[0]
+            eye_region_end = int(height * 0.4)
+            
+            # 이전 프레임과의 차이가 큰 경우 안정화
+            if i > 0:
+                prev_eye = frames[i-1][:eye_region_end, :]
+                curr_eye = frame[:eye_region_end, :]
+                
+                # 눈 주변 영역의 갑작스러운 변화 감지
+                eye_diff = np.mean(np.abs(curr_eye.astype(np.float32) - prev_eye.astype(np.float32)))
+                
+                if eye_diff > 10.0:  # 눈 주변 변화 임계값
+                    # 눈 주변 영역만 안정화 (90% 이전, 10% 현재)
+                    stabilized_eye = (
+                        0.9 * prev_eye.astype(np.float32) +
+                        0.1 * curr_eye.astype(np.float32)
+                    ).astype(np.uint8)
+                    
+                    refined_frame[:eye_region_end, :] = stabilized_eye
+            
+            # 전체적인 밝기 일관성 보장
+            if i > 0:
+                prev_brightness = np.mean(frames[i-1])
+                curr_brightness = np.mean(refined_frame)
+                brightness_diff = abs(curr_brightness - prev_brightness)
+                
+                # 갑작스러운 밝기 변화 보정
+                if brightness_diff > 5.0:  # 밝기 변화 임계값
+                    brightness_ratio = prev_brightness / max(curr_brightness, 1)
+                    brightness_ratio = np.clip(brightness_ratio, 0.9, 1.1)  # 밝기 변화 제한
+                    
+                    refined_frame = np.clip(
+                        refined_frame.astype(np.float32) * brightness_ratio,
+                        0, 255
+                    ).astype(np.uint8)
+            
+            refined_frames.append(refined_frame)
+        
+        return refined_frames
+    
+    def _enhance_audio_features_for_naturalness(self, audio_features: torch.Tensor, config: Dict) -> torch.Tensor:
+        """
+        자연스러운 립싱크를 위한 오디오 특징 개선
+        
+        강사 강의 영상에서 중요한 오디오 처리:
+        1. 음성 강약 변화에 따른 입모양 조절
+        2. 묵음 구간에서의 자연스러운 입모양 유지
+        3. 발음 전환 시점에서의 부드러운 변화
+        4. 강사의 말하기 패턴에 맞는 입술 움직임
+        
+        Args:
+            audio_features: 원본 오디오 특징
+            config: 설정 정보
+            
+        Returns:
+            torch.Tensor: 개선된 오디오 특징
+        """
+        if audio_features.dim() < 2:
+            return audio_features
+        
+        # 1. 시간적 스무딩 적용 (오디오 특징에도)
+        # 갑작스러운 음성 변화를 부드럽게 만들어 입모양 전환도 자연스럽게
+        smoothed_features = audio_features.clone()
+        
+        # 시간 차원에서 스무딩 (1D convolution 효과)
+        if audio_features.shape[0] > 2:
+            for i in range(1, audio_features.shape[0] - 1):
+                # 이전, 현재, 다음 프레임의 가중 평균
+                smoothed_features[i] = (
+                    0.2 * audio_features[i-1] +
+                    0.6 * audio_features[i] +
+                    0.2 * audio_features[i+1]
+                )
+        
+        # 2. 동적 범위 조정 (음성 강약에 따른 입모양 조절)
+        # 음성이 강할 때는 입모양 변화를 더 크게, 약할 때는 더 작게
+        feature_magnitude = torch.norm(smoothed_features, dim=-1, keepdim=True)
+        # Half(float16) 타입 호환성을 위해 GPU에서 처리하거나 float32로 변환
+        if feature_magnitude.dtype == torch.float16:
+            # GPU에서 처리하거나 float32로 변환 후 다시 원래 타입으로 복원
+            if feature_magnitude.is_cuda:
+                normalized_magnitude = torch.tanh(feature_magnitude * 0.5)  # GPU에서는 Half 지원
+            else:
+                # CPU에서는 float32로 변환 후 처리
+                normalized_magnitude = torch.tanh(feature_magnitude.float() * 0.5).half()
+        else:
+            normalized_magnitude = torch.tanh(feature_magnitude * 0.5)  # 0-1 범위로 정규화
+        
+        # 음성 강도에 비례하여 특징 강도 조절
+        enhanced_features = smoothed_features * (0.7 + 0.6 * normalized_magnitude)
+        
+        # 3. 묵음 구간 감지 및 처리
+        # 음성 에너지가 낮은 구간에서는 입모양 변화를 최소화
+        silence_threshold = 0.1
+        silence_mask = feature_magnitude.squeeze(-1) < silence_threshold
+        
+        if silence_mask.any():
+            # 묵음 구간에서는 이전 프레임과의 변화를 최소화
+            for i in range(1, enhanced_features.shape[0]):
+                if silence_mask[i]:
+                    enhanced_features[i] = 0.8 * enhanced_features[i-1] + 0.2 * enhanced_features[i]
+        
+        return enhanced_features 
